@@ -84,8 +84,10 @@ from .issue import (
     IssueListDetailSerializer,
 )
 from .issue_chat import (
+    IssueChatBindingCreateSerializer,
     IssueChatBindingSerializer,
     IssueChatBindingSyncSerializer,
+    IssueChatManualAttentionSerializer,
     IssueChatProgressSerializer,
 )
 

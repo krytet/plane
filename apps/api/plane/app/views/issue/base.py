@@ -74,6 +74,8 @@ from plane.utils.serializers import writable_data
 from plane.utils.issue_filters import issue_filters
 from plane.utils.issue_chat import (
     IssueChatConflict,
+    attach_group_chat_presence,
+    attach_issue_chat_presence,
     can_view_issue_chat_progress,
     merge_latest_chat_description,
     redact_issue_description_fields,
@@ -210,6 +212,12 @@ class IssueListEndpoint(BaseAPIView):
             )
             datetime_fields = ["created_at", "updated_at"]
             issues = user_timezone_converter(issues, datetime_fields, request.user.user_timezone)
+        issues = attach_issue_chat_presence(
+            issues,
+            request.user,
+            slug,
+            project_id,
+        )
         return Response(issues, status=status.HTTP_200_OK)
 
 
@@ -308,6 +316,20 @@ class IssueViewSet(BaseViewSet):
         # issue queryset
         issue_queryset = issue_queryset_grouper(queryset=issue_queryset, group_by=group_by, sub_group_by=sub_group_by)
 
+        can_view_chat_presence = can_view_issue_chat_progress(request.user, slug, project_id)
+
+        def issue_cards(issues):
+            return attach_issue_chat_presence(
+                issue_on_results(
+                    group_by=group_by,
+                    issues=issues,
+                    sub_group_by=sub_group_by,
+                ),
+                request.user,
+                slug,
+                project_id,
+            )
+
         recent_visited_task.delay(
             slug=slug,
             project_id=project_id,
@@ -343,9 +365,8 @@ class IssueViewSet(BaseViewSet):
                         order_by=order_by_param,
                         queryset=issue_queryset,
                         total_count_queryset=filtered_issue_queryset,
-                        on_results=lambda issues: issue_on_results(
-                            group_by=group_by, issues=issues, sub_group_by=sub_group_by
-                        ),
+                        on_results=issue_cards,
+                        controller=attach_group_chat_presence if can_view_chat_presence else None,
                         paginator_cls=SubGroupedOffsetPaginator,
                         group_by_fields=issue_group_values(
                             field=group_by,
@@ -379,9 +400,8 @@ class IssueViewSet(BaseViewSet):
                     order_by=order_by_param,
                     queryset=issue_queryset,
                     total_count_queryset=filtered_issue_queryset,
-                    on_results=lambda issues: issue_on_results(
-                        group_by=group_by, issues=issues, sub_group_by=sub_group_by
-                    ),
+                    on_results=issue_cards,
+                    controller=attach_group_chat_presence if can_view_chat_presence else None,
                     paginator_cls=GroupedOffsetPaginator,
                     group_by_fields=issue_group_values(
                         field=group_by,
@@ -406,7 +426,7 @@ class IssueViewSet(BaseViewSet):
                 request=request,
                 queryset=issue_queryset,
                 total_count_queryset=filtered_issue_queryset,
-                on_results=lambda issues: issue_on_results(group_by=group_by, issues=issues, sub_group_by=sub_group_by),
+                on_results=issue_cards,
             )
 
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER])

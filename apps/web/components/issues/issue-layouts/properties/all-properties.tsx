@@ -43,6 +43,7 @@ import { useAppRouter } from "@/hooks/use-app-router";
 import { useIssueStoreType } from "@/hooks/use-issue-layout-store";
 import { usePlatformOS } from "@/hooks/use-platform-os";
 // local components
+import { IssueChatPresenceBadge } from "./chat-presence";
 import { IssuePropertyLabels } from "./labels";
 import { WithDisplayPropertiesHOC } from "./with-display-properties-HOC";
 
@@ -57,7 +58,7 @@ export interface IIssueProperties {
 }
 
 export const IssueProperties = observer(function IssueProperties(props: IIssueProperties) {
-  const { issue, updateIssue, displayProperties, isReadOnly, className, isEpic = false } = props;
+  const { issue, updateIssue, displayProperties, isReadOnly, className, activeLayout, isEpic = false } = props;
   // i18n
   const { t } = useTranslation();
   // store hooks
@@ -458,6 +459,10 @@ export const IssueProperties = observer(function IssueProperties(props: IIssuePr
           </div>
         </Tooltip>
       </WithDisplayPropertiesHOC>
+
+      {(activeLayout === "List" || activeLayout === "Kanban") && (
+        <IssueChatPresenceBadge presence={issue.chat_presence} />
+      )}
 
       {/* label */}
       <WithDisplayPropertiesHOC displayProperties={displayProperties} displayPropertyKey="labels">

@@ -389,6 +389,17 @@ class IssueChatBinding(ProjectBaseModel):
         CODEX = "codex", "Codex"
         CHATGPT = "chatgpt", "ChatGPT"
 
+    class ObservationState(models.TextChoices):
+        UNKNOWN = "unknown", "Unknown"
+        RUNNING = "running", "Running"
+        ANSWER_AVAILABLE = "answer_available", "Answer available"
+        NEEDS_ACTION = "needs_action", "Needs action"
+        FAILED = "failed", "Failed"
+
+    class ObservationSource(models.TextChoices):
+        MANUAL = "manual", "Manual"
+        CODEX = "codex", "Codex"
+
     issue = models.ForeignKey("db.Issue", on_delete=models.CASCADE, related_name="chat_bindings")
     link = models.OneToOneField(
         "db.IssueLink",
@@ -404,6 +415,19 @@ class IssueChatBinding(ProjectBaseModel):
     payload_hash = models.CharField(max_length=64, blank=True, default="")
     generated_block_hash = models.CharField(max_length=64, blank=True, default="")
     last_synced_at = models.DateTimeField(null=True, blank=True)
+    observation_state = models.CharField(
+        max_length=20,
+        choices=ObservationState.choices,
+        default=ObservationState.UNKNOWN,
+    )
+    observation_source = models.CharField(
+        max_length=20,
+        choices=ObservationSource.choices,
+        null=True,
+        blank=True,
+    )
+    observation_observed_at = models.DateTimeField(null=True, blank=True)
+    observation_turn_id = models.CharField(max_length=255, blank=True, default="")
 
     class Meta:
         verbose_name = "Issue Chat Binding"
@@ -420,6 +444,52 @@ class IssueChatBinding(ProjectBaseModel):
 
     def __str__(self):
         return f"{self.provider}:{self.thread_id} <{self.issue.name}>"
+
+    @property
+    def has_attention(self):
+        return self.observation_state in {
+            self.ObservationState.ANSWER_AVAILABLE,
+            self.ObservationState.NEEDS_ACTION,
+            self.ObservationState.FAILED,
+        }
+
+    @property
+    def is_manual_attention(self):
+        return (
+            self.observation_state == self.ObservationState.NEEDS_ACTION
+            and self.observation_source == self.ObservationSource.MANUAL
+        )
+
+
+class IssueChatBindingSeen(ProjectBaseModel):
+    binding = models.ForeignKey(
+        "db.IssueChatBinding",
+        on_delete=models.CASCADE,
+        related_name="seen_acknowledgements",
+    )
+    member = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="issue_chat_binding_seen",
+    )
+    observed_at = models.DateTimeField(null=True, blank=True)
+    turn_id = models.CharField(max_length=255, blank=True, default="")
+
+    class Meta:
+        verbose_name = "Issue Chat Binding Seen"
+        verbose_name_plural = "Issue Chat Binding Seen"
+        db_table = "issue_chat_binding_seen"
+        ordering = ("-updated_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["binding", "member"],
+                condition=Q(deleted_at__isnull=True),
+                name="issue_chat_binding_seen_unique_binding_member_active",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.binding_id} seen by {self.member_id}"
 
 
 def get_upload_path(instance, filename):

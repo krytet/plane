@@ -4,17 +4,29 @@
  * See the LICENSE file for details.
  */
 
-import type { TIssueChatProgress, TIssueChatProvider } from "@plane/types";
+import type {
+  TIssueChatBinding,
+  TIssueChatObservationSource,
+  TIssueChatObservationState,
+  TIssueChatProvider,
+} from "@plane/types";
 
 const PROVIDER_LABELS: Record<TIssueChatProvider, string> = {
   codex: "Codex",
   chatgpt: "ChatGPT",
 };
 
-const EMPTY_PROGRESS: TIssueChatProgress = {
-  done: [],
-  now: [],
-  waiting: [],
+const OBSERVATION_STATE_LABELS: Record<TIssueChatObservationState, string> = {
+  unknown: "No reported state",
+  running: "Running",
+  answer_available: "Answer available",
+  needs_action: "Needs action",
+  failed: "Failed",
+};
+
+const OBSERVATION_SOURCE_LABELS: Record<TIssueChatObservationSource, string> = {
+  manual: "Marked manually in Plane",
+  codex: "Codex observation",
 };
 
 const PROVIDER_HOSTS: Record<TIssueChatProvider, Set<string>> = {
@@ -29,27 +41,23 @@ const CODEX_NATIVE_URL_PREFIX = "codex://threads/";
 export const getIssueChatProviderLabel = (provider: TIssueChatProvider): string =>
   PROVIDER_LABELS[provider] ?? provider;
 
-export const normalizeIssueChatProgress = (
-  progress: Partial<TIssueChatProgress> | null | undefined
-): TIssueChatProgress => ({
-  done: Array.isArray(progress?.done) ? progress.done.filter((item) => item.trim().length > 0) : [],
-  now: Array.isArray(progress?.now) ? progress.now.filter((item) => item.trim().length > 0) : [],
-  waiting: Array.isArray(progress?.waiting) ? progress.waiting.filter((item) => item.trim().length > 0) : [],
-});
+export const getIssueChatObservationStateLabel = (state: TIssueChatObservationState): string =>
+  OBSERVATION_STATE_LABELS[state] ?? state;
 
-export const hasIssueChatProgress = (progress: Partial<TIssueChatProgress> | null | undefined): boolean => {
-  const normalized = normalizeIssueChatProgress(progress);
-  return normalized.done.length > 0 || normalized.now.length > 0 || normalized.waiting.length > 0;
-};
+export const getIssueChatObservationSourceLabel = (source: TIssueChatObservationSource | null): string =>
+  source ? OBSERVATION_SOURCE_LABELS[source] : "Source not reported";
 
-export const formatIssueChatFreshness = (lastSyncedAt: string | null | undefined, now = Date.now()): string => {
-  if (!lastSyncedAt) return "Not synced yet";
+export const formatIssueChatObservationFreshness = (
+  observedAt: string | null | undefined,
+  now = Date.now()
+): string => {
+  if (!observedAt) return "No observation yet";
 
-  const timestamp = Date.parse(lastSyncedAt);
-  if (Number.isNaN(timestamp)) return "Sync time unavailable";
+  const timestamp = Date.parse(observedAt);
+  if (Number.isNaN(timestamp)) return "Observation time unavailable";
 
   const elapsedSeconds = Math.max(0, Math.floor((now - timestamp) / 1000));
-  if (elapsedSeconds < 60) return "Synced just now";
+  if (elapsedSeconds < 60) return "Observed just now";
 
   const units = [
     { seconds: 86_400, label: "day" },
@@ -60,11 +68,28 @@ export const formatIssueChatFreshness = (lastSyncedAt: string | null | undefined
   for (const unit of units) {
     if (elapsedSeconds >= unit.seconds) {
       const count = Math.floor(elapsedSeconds / unit.seconds);
-      return `Synced ${count} ${unit.label}${count === 1 ? "" : "s"} ago`;
+      return `Observed ${count} ${unit.label}${count === 1 ? "" : "s"} ago`;
     }
   }
 
-  return "Synced just now";
+  return "Observed just now";
+};
+
+export const getIssueChatPlaneReadLabel = (
+  binding: Pick<TIssueChatBinding, "attention" | "unread" | "seen_at">
+): string | undefined => {
+  if (!binding.attention) return undefined;
+  if (binding.unread) return "Unread in Plane";
+  return binding.seen_at ? "Seen in Plane" : undefined;
+};
+
+export const getIssueChatManualAttentionAction = (
+  binding: Pick<TIssueChatBinding, "provider" | "manual_attention">
+): { label: string; value: "needs_action" | "clear" } | null => {
+  if (binding.provider !== "chatgpt") return null;
+  return binding.manual_attention
+    ? { label: "Clear manual attention", value: "clear" }
+    : { label: "Mark needs action", value: "needs_action" };
 };
 
 export const getCodexThreadDeepLink = (threadId: string): string | undefined => {
@@ -144,5 +169,3 @@ export const getSafeIssueChatWebLink = (value: string | null | undefined): strin
     return undefined;
   }
 };
-
-export const getEmptyIssueChatProgress = (): TIssueChatProgress => ({ ...EMPTY_PROGRESS });

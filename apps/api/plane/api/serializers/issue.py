@@ -35,6 +35,8 @@ from plane.utils.content_validator import (
 from plane.utils.issue_chat import (
     IssueChatConflict,
     IssueChatInputError,
+    binding_is_unread,
+    get_current_user_seen,
     normalize_chat_binding_url,
     redact_issue_activity_fields,
     redact_issue_description_fields,
@@ -581,8 +583,53 @@ class IssueChatBindingSyncSerializer(serializers.Serializer):
         return attrs
 
 
+class IssueChatObservationSerializer(serializers.Serializer):
+    """Typed Codex observation metadata. Chat text is intentionally unsupported."""
+
+    state = serializers.ChoiceField(choices=IssueChatBinding.ObservationState.choices)
+    observed_at = serializers.DateTimeField()
+    turn_id = serializers.CharField(max_length=255, trim_whitespace=True)
+
+    def validate_turn_id(self, value):
+        if not value:
+            raise serializers.ValidationError("Turn ID cannot be blank.")
+        return value
+
+    def validate(self, attrs):
+        unsupported = sorted(set(self.initial_data) - {"state", "observed_at", "turn_id"})
+        if unsupported:
+            raise serializers.ValidationError(
+                {
+                    field: "Only typed observation metadata is supported; chat text is not accepted."
+                    for field in unsupported
+                }
+            )
+        return attrs
+
+
 class IssueChatBindingSerializer(BaseSerializer):
     link = IssueLinkSerializer(read_only=True)
+    manual_attention = serializers.SerializerMethodField()
+    attention = serializers.SerializerMethodField()
+    unread = serializers.SerializerMethodField()
+    seen_at = serializers.SerializerMethodField()
+
+    def _seen(self, obj):
+        request = self.context.get("request")
+        return get_current_user_seen(obj, getattr(request, "user", None))
+
+    def get_manual_attention(self, obj):
+        return obj.is_manual_attention
+
+    def get_attention(self, obj):
+        return obj.has_attention
+
+    def get_unread(self, obj):
+        return binding_is_unread(obj, self._seen(obj))
+
+    def get_seen_at(self, obj):
+        seen = self._seen(obj)
+        return seen.updated_at if seen is not None else None
 
     class Meta:
         model = IssueChatBinding
@@ -595,6 +642,14 @@ class IssueChatBindingSerializer(BaseSerializer):
             "sync_cursor",
             "progress",
             "last_synced_at",
+            "observation_state",
+            "observation_source",
+            "observation_observed_at",
+            "observation_turn_id",
+            "manual_attention",
+            "attention",
+            "unread",
+            "seen_at",
             "created_at",
             "updated_at",
         ]

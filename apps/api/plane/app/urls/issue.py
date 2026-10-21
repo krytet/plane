@@ -32,6 +32,8 @@ from plane.app.views import (
     IssueMetaEndpoint,
     IssueDetailIdentifierEndpoint,
     IssueChatBindingEndpoint,
+    IssueChatBindingSeenEndpoint,
+    IssueChatManualAttentionEndpoint,
 )
 
 urlpatterns = [
@@ -128,6 +130,16 @@ urlpatterns = [
         "workspaces/<str:slug>/projects/<uuid:project_id>/issues/<uuid:issue_id>/chat-bindings/",
         IssueChatBindingEndpoint.as_view(),
         name="project-issue-chat-bindings",
+    ),
+    path(
+        "workspaces/<str:slug>/projects/<uuid:project_id>/issues/<uuid:issue_id>/chat-bindings/<uuid:binding_id>/seen/",
+        IssueChatBindingSeenEndpoint.as_view(),
+        name="project-issue-chat-binding-seen",
+    ),
+    path(
+        "workspaces/<str:slug>/projects/<uuid:project_id>/issues/<uuid:issue_id>/chat-bindings/<uuid:binding_id>/manual-attention/",
+        IssueChatManualAttentionEndpoint.as_view(),
+        name="project-issue-chat-binding-manual-attention",
     ),
     path(
         "workspaces/<str:slug>/projects/<uuid:project_id>/issues/<uuid:issue_id>/issue-attachments/",

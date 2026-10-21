@@ -9,6 +9,7 @@ import type { TStateGroups } from "../state";
 import type { TIssuePublicComment } from "./activity/issue_comment";
 import type { TIssueAttachment } from "./issue_attachment";
 import type { TIssueLink } from "./issue_link";
+import type { TIssueChatPresence } from "./issue_chat_binding";
 import type { TIssueReaction, IIssuePublicReaction, IPublicVote } from "./issue_reaction";
 import type { TIssueRelationTypes } from "./issue_relation";
 
@@ -77,6 +78,7 @@ export type TBaseIssue = {
   is_draft: boolean;
   is_epic?: boolean;
   is_intake?: boolean;
+  chat_presence?: TIssueChatPresence;
 };
 
 type IssueRelation = {
@@ -117,9 +119,11 @@ export type TIssueResponseResults =
               [key: string]: {
                 results: TBaseIssue[];
                 total_results: number;
+                chat_presence?: TIssueChatPresence;
               };
             };
         total_results: number;
+        chat_presence?: TIssueChatPresence;
       };
     };
 

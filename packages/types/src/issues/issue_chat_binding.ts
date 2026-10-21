@@ -14,6 +14,12 @@ export type TIssueChatProgress = {
   waiting: string[];
 };
 
+export type TIssueChatObservationState = "unknown" | "running" | "answer_available" | "needs_action" | "failed";
+
+export type TIssueChatObservationSource = "manual" | "codex";
+
+export type TIssueChatManualAttention = "needs_action" | "clear";
+
 export type TIssueChatBinding = {
   id: string;
   issue_id: string;
@@ -23,8 +29,23 @@ export type TIssueChatBinding = {
   sync_cursor: number;
   progress: TIssueChatProgress;
   last_synced_at: string | null;
+  observation_state: TIssueChatObservationState;
+  observation_source: TIssueChatObservationSource | null;
+  observation_observed_at: string | null;
+  observation_turn_id: string;
+  manual_attention: boolean;
+  attention: boolean;
+  unread: boolean;
+  seen_at: string | null;
   created_at?: string;
   updated_at?: string;
+};
+
+export type TIssueChatPresence = {
+  count: number;
+  attention: number;
+  unread: number;
+  manual_attention: number;
 };
 
 export type TIssueChatBindingCreate = {
@@ -32,6 +53,11 @@ export type TIssueChatBindingCreate = {
   url?: string;
   thread_id: string;
   title?: string;
+};
+
+export type TIssueChatBindingResponse = TIssueChatBinding & {
+  applied: boolean;
+  acknowledgement_source?: "plane";
 };
 
 export type TIssueChatBindingSyncResponse = TIssueChatBinding & {

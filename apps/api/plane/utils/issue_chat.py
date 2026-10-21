@@ -16,12 +16,19 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import URLValidator
 from django.db import IntegrityError, transaction
-from django.db.models import CharField, Value
+from django.db.models import CharField, Prefetch, Value
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from plane.db.models import Issue, IssueChatBinding, IssueLink, ProjectMember, WorkspaceMember
+from plane.db.models import (
+    Issue,
+    IssueChatBinding,
+    IssueChatBindingSeen,
+    IssueLink,
+    ProjectMember,
+    WorkspaceMember,
+)
 from plane.db.models.project import ROLE
 
 
@@ -38,6 +45,13 @@ PROVIDER_HOSTS = {
         {"chatgpt.com", "www.chatgpt.com", "chat.openai.com", "www.chat.openai.com"}
     ),
 }
+OBSERVATION_ATTENTION_STATES = frozenset(
+    {
+        IssueChatBinding.ObservationState.ANSWER_AVAILABLE,
+        IssueChatBinding.ObservationState.NEEDS_ACTION,
+        IssueChatBinding.ObservationState.FAILED,
+    }
+)
 
 _DIV_START_RE = re.compile(r"<div\b[^>]*>", re.IGNORECASE)
 _DIV_END_RE = re.compile(r"</div\s*>", re.IGNORECASE)
@@ -83,6 +97,25 @@ class IssueChatProgressConflict(IssueChatConflict):
 class IssueChatSyncResult:
     binding: IssueChatBinding
     created: bool
+    applied: bool
+
+
+@dataclass(frozen=True)
+class IssueChatBindingCreateResult:
+    binding: IssueChatBinding
+    created: bool
+
+
+@dataclass(frozen=True)
+class IssueChatObservationResult:
+    binding: IssueChatBinding
+    applied: bool
+
+
+@dataclass(frozen=True)
+class IssueChatSeenResult:
+    binding: IssueChatBinding
+    acknowledgement: IssueChatBindingSeen
     applied: bool
 
 
@@ -588,6 +621,124 @@ def can_view_issue_chat_progress(user, workspace_slug, project_id):
     ).exists()
 
 
+def issue_chat_presence_summaries(user, workspace_slug, project_id, issue_ids):
+    """Return compact board counts only for users allowed to see chat presence."""
+
+    if not can_view_issue_chat_progress(user, workspace_slug, project_id):
+        return {}
+
+    normalized_issue_ids = {str(issue_id): issue_id for issue_id in issue_ids if issue_id}
+    summaries = {
+        issue_id: {
+            "count": 0,
+            "attention": 0,
+            "unread": 0,
+            "manual_attention": 0,
+        }
+        for issue_id in normalized_issue_ids
+    }
+    if not summaries:
+        return summaries
+
+    bindings = list(
+        IssueChatBinding.objects.filter(
+            workspace__slug=workspace_slug,
+            project_id=project_id,
+            issue_id__in=normalized_issue_ids.values(),
+        ).only(
+            "id",
+            "issue_id",
+            "observation_state",
+            "observation_source",
+            "observation_observed_at",
+        )
+    )
+    seen_by_binding = {
+        seen.binding_id: seen
+        for seen in IssueChatBindingSeen.objects.filter(
+            member=user,
+            binding_id__in=[binding.id for binding in bindings],
+        )
+    }
+    for binding in bindings:
+        summary = summaries[str(binding.issue_id)]
+        summary["count"] += 1
+        if binding.has_attention:
+            summary["attention"] += 1
+        if binding.is_manual_attention:
+            summary["manual_attention"] += 1
+        if binding_is_unread(binding, seen_by_binding.get(binding.id)):
+            summary["unread"] += 1
+    return summaries
+
+
+def attach_issue_chat_presence(issues, user, workspace_slug, project_id):
+    """Attach ``chat_presence`` to internal board cards for authorized roles."""
+
+    if not can_view_issue_chat_progress(user, workspace_slug, project_id):
+        return issues
+
+    rows = list(issues)
+    summaries = issue_chat_presence_summaries(
+        user,
+        workspace_slug,
+        project_id,
+        [row.get("id") for row in rows],
+    )
+    for row in rows:
+        row["chat_presence"] = summaries.get(
+            str(row.get("id")),
+            {
+                "count": 0,
+                "attention": 0,
+                "unread": 0,
+                "manual_attention": 0,
+            },
+        )
+    return rows
+
+
+def attach_group_chat_presence(grouped_results):
+    """Add a card-count/attention summary to each grouped response level."""
+
+    if not isinstance(grouped_results, dict):
+        return grouped_results
+
+    def summarize(value):
+        totals = {
+            "count": 0,
+            "attention": 0,
+            "unread": 0,
+            "manual_attention": 0,
+        }
+
+        def walk(node):
+            if isinstance(node, list):
+                for item in node:
+                    walk(item)
+                return
+            if not isinstance(node, dict):
+                return
+            presence = node.get("chat_presence")
+            if isinstance(presence, dict):
+                for key in totals:
+                    totals[key] += int(presence.get(key, 0) or 0)
+            if "results" in node:
+                walk(node["results"])
+
+        walk(value)
+        return totals
+
+    for group in grouped_results.values():
+        if isinstance(group, dict) and "results" in group:
+            group["chat_presence"] = summarize(group["results"])
+            if isinstance(group["results"], dict):
+                for subgroup in group["results"].values():
+                    if isinstance(subgroup, dict) and "results" in subgroup:
+                        subgroup["chat_presence"] = summarize(subgroup["results"])
+    return grouped_results
+
+
 def scope_issue_links_for_user(queryset, user, workspace_slug, project_id):
     """Hide managed chat links from users who cannot see generated progress."""
 
@@ -799,11 +950,11 @@ def _issue_queryset(workspace_slug, project_id):
     )
 
 
-def list_issue_chat_bindings(workspace_slug, project_id, issue_id):
+def list_issue_chat_bindings(workspace_slug, project_id, issue_id, user=None):
     if not _issue_queryset(workspace_slug, project_id).filter(pk=issue_id).exists():
         raise IssueChatNotFound
 
-    return (
+    queryset = (
         IssueChatBinding.objects.filter(
             workspace__slug=workspace_slug,
             project_id=project_id,
@@ -812,6 +963,82 @@ def list_issue_chat_bindings(workspace_slug, project_id, issue_id):
         .select_related("link")
         .order_by("-created_at")
     )
+    if user is not None and getattr(user, "is_authenticated", False):
+        queryset = queryset.prefetch_related(
+            Prefetch(
+                "seen_acknowledgements",
+                queryset=IssueChatBindingSeen.objects.filter(member=user),
+                to_attr="current_user_seen_acknowledgements",
+            )
+        )
+    return queryset
+
+
+def get_current_user_seen(binding, user=None):
+    acknowledgements = getattr(binding, "current_user_seen_acknowledgements", None)
+    if acknowledgements is not None:
+        return acknowledgements[0] if acknowledgements else None
+    if user is None or not getattr(user, "is_authenticated", False):
+        return None
+    return IssueChatBindingSeen.objects.filter(binding=binding, member=user).first()
+
+
+def binding_is_unread(binding, acknowledgement=None):
+    """Return Plane-local unread attention, never a provider read receipt."""
+
+    if binding.observation_state not in OBSERVATION_ATTENTION_STATES:
+        return False
+    if binding.observation_observed_at is None:
+        return False
+    if acknowledgement is None or acknowledgement.observed_at is None:
+        return True
+    return binding.observation_observed_at > acknowledgement.observed_at
+
+
+def _normalize_binding_identity(provider, thread_id, url):
+    normalized_thread_id = (thread_id or "").strip()
+    if provider == IssueChatBinding.Provider.CODEX:
+        normalized_thread_id = normalize_codex_thread_id(normalized_thread_id) or normalized_thread_id
+    return normalized_thread_id, normalize_chat_binding_url(provider, normalized_thread_id, url)
+
+
+def _ensure_chat_link(binding, issue, actor, provider, thread_id, requested_url, requested_title):
+    link = binding.link
+    if link is not None and link.issue_id != issue.id:
+        raise IssueChatConflict(
+            "invalid_link",
+            "The existing visible chat link does not belong to this work item.",
+        )
+    if link is None or link.deleted_at is not None:
+        if requested_url is None:
+            raise IssueChatInputError("url", "url is required when creating a chat binding.")
+        provider_label = dict(IssueChatBinding.Provider.choices)[provider]
+        link = IssueLink.objects.create(
+            workspace=issue.workspace,
+            project=issue.project,
+            issue=issue,
+            url=requested_url,
+            title=requested_title or f"{provider_label} chat",
+            metadata={
+                "kind": "chat",
+                "chat_binding_id": str(binding.id),
+                "provider": provider,
+                "thread_id": thread_id,
+            },
+            created_by_id=actor.id,
+        )
+        return link
+
+    link_updates = {}
+    if requested_url and requested_url != link.url:
+        link_updates["url"] = requested_url
+    if requested_title is not None and requested_title != link.title:
+        link_updates["title"] = requested_title
+    if link_updates:
+        link_updates["updated_at"] = timezone.now()
+        IssueLink.objects.filter(pk=link.pk).update(**link_updates)
+        link.refresh_from_db(fields=list(link_updates))
+    return link
 
 
 def _create_binding(issue, actor, provider, thread_id):
@@ -833,6 +1060,270 @@ def _create_binding(issue, actor, provider, thread_id):
         ) from exc
 
 
+def create_issue_chat_binding(
+    *,
+    workspace_slug,
+    project_id,
+    issue_id,
+    actor,
+    provider,
+    thread_id,
+    url=None,
+    title=None,
+):
+    """Create or return a manual binding without inventing sync state."""
+
+    normalized_thread_id, requested_url = _normalize_binding_identity(provider, thread_id, url)
+    requested_title = _normalize_item(title) if title else None
+
+    try:
+        with transaction.atomic():
+            issue = (
+                _issue_queryset(workspace_slug, project_id)
+                .select_for_update(of=("self",))
+                .select_related("project")
+                .filter(pk=issue_id)
+                .first()
+            )
+            if issue is None:
+                raise IssueChatNotFound
+
+            binding = (
+                IssueChatBinding.objects.select_for_update(of=("self",))
+                .filter(
+                    workspace_id=issue.workspace_id,
+                    provider=provider,
+                    thread_id=normalized_thread_id,
+                )
+                .select_related("link")
+                .first()
+            )
+            created = binding is None
+            if created:
+                if requested_url is None:
+                    raise IssueChatInputError("url", "url is required when creating a chat binding.")
+                binding = _create_binding(issue, actor, provider, normalized_thread_id)
+            elif binding.issue_id != issue.id:
+                raise IssueChatConflict(
+                    "thread_already_bound",
+                    "This provider thread is already bound to another work item.",
+                )
+
+            link = _ensure_chat_link(
+                binding,
+                issue,
+                actor,
+                provider,
+                normalized_thread_id,
+                requested_url,
+                requested_title,
+            )
+            if binding.link_id != link.id:
+                binding.link = link
+                binding.save(update_fields=["link", "updated_at"])
+    except IntegrityError as exc:
+        raise IssueChatConflict(
+            "thread_already_bound",
+            "This provider thread is already bound to another work item.",
+        ) from exc
+
+    return IssueChatBindingCreateResult(binding=binding, created=created)
+
+
+def update_issue_chat_observation(
+    *,
+    workspace_slug,
+    project_id,
+    issue_id,
+    binding_id,
+    state,
+    observed_at,
+    turn_id,
+):
+    """Apply an idempotent typed Codex observation to an existing binding."""
+
+    normalized_turn_id = (turn_id or "").strip()
+    if not normalized_turn_id:
+        raise IssueChatInputError("turn_id", "turn_id is required.")
+    if state not in IssueChatBinding.ObservationState.values:
+        raise IssueChatInputError("state", "A valid observation state is required.")
+
+    with transaction.atomic():
+        binding = (
+            IssueChatBinding.objects.select_for_update(of=("self",))
+            .select_related("link")
+            .filter(
+                pk=binding_id,
+                workspace__slug=workspace_slug,
+                project_id=project_id,
+                issue_id=issue_id,
+            )
+            .first()
+        )
+        if binding is None:
+            raise IssueChatNotFound
+        if binding.provider != IssueChatBinding.Provider.CODEX:
+            raise IssueChatConflict(
+                "provider_observation_unsupported",
+                "Automatic observations are supported for explicitly bound Codex chats only.",
+            )
+
+        current_observed_at = binding.observation_observed_at
+        if current_observed_at is not None:
+            if observed_at < current_observed_at:
+                raise IssueChatConflict(
+                    "stale_observation",
+                    "The observation is older than the last applied observation.",
+                )
+            if observed_at == current_observed_at:
+                if (
+                    binding.observation_source == IssueChatBinding.ObservationSource.CODEX
+                    and binding.observation_state == state
+                    and binding.observation_turn_id == normalized_turn_id
+                ):
+                    return IssueChatObservationResult(binding=binding, applied=False)
+                raise IssueChatConflict(
+                    "observation_reused",
+                    "This observation time was already used with different data.",
+                )
+            if (
+                binding.observation_turn_id == normalized_turn_id
+                and binding.observation_state
+                in {
+                    IssueChatBinding.ObservationState.ANSWER_AVAILABLE,
+                    IssueChatBinding.ObservationState.NEEDS_ACTION,
+                    IssueChatBinding.ObservationState.FAILED,
+                }
+                and state == IssueChatBinding.ObservationState.RUNNING
+            ):
+                raise IssueChatConflict(
+                    "invalid_transition",
+                    "A completed turn cannot return to running.",
+                )
+
+        binding.observation_state = state
+        binding.observation_source = IssueChatBinding.ObservationSource.CODEX
+        binding.observation_observed_at = observed_at
+        binding.observation_turn_id = normalized_turn_id
+        binding.save(
+            update_fields=[
+                "observation_state",
+                "observation_source",
+                "observation_observed_at",
+                "observation_turn_id",
+                "updated_at",
+            ]
+        )
+
+    return IssueChatObservationResult(binding=binding, applied=True)
+
+
+def set_issue_chat_manual_attention(
+    *,
+    workspace_slug,
+    project_id,
+    issue_id,
+    binding_id,
+    needs_action,
+):
+    """Set or clear an explicitly manual ChatGPT attention flag."""
+
+    with transaction.atomic():
+        binding = (
+            IssueChatBinding.objects.select_for_update(of=("self",))
+            .select_related("link")
+            .filter(
+                pk=binding_id,
+                workspace__slug=workspace_slug,
+                project_id=project_id,
+                issue_id=issue_id,
+            )
+            .first()
+        )
+        if binding is None:
+            raise IssueChatNotFound
+        if binding.provider != IssueChatBinding.Provider.CHATGPT:
+            raise IssueChatConflict(
+                "manual_attention_unsupported",
+                "Manual attention is only available for ChatGPT bindings; Codex presence comes from observations.",
+            )
+
+        if needs_action:
+            next_values = {
+                "observation_state": IssueChatBinding.ObservationState.NEEDS_ACTION,
+                "observation_source": IssueChatBinding.ObservationSource.MANUAL,
+                "observation_observed_at": timezone.now(),
+                "observation_turn_id": "",
+            }
+        else:
+            next_values = {
+                "observation_state": IssueChatBinding.ObservationState.UNKNOWN,
+                "observation_source": None,
+                "observation_observed_at": None,
+                "observation_turn_id": "",
+            }
+
+        applied = any(getattr(binding, field) != value for field, value in next_values.items())
+        if applied:
+            for field, value in next_values.items():
+                setattr(binding, field, value)
+            binding.save(update_fields=[*next_values, "updated_at"])
+
+    return IssueChatObservationResult(binding=binding, applied=applied)
+
+
+def acknowledge_issue_chat_binding(
+    *,
+    workspace_slug,
+    project_id,
+    issue_id,
+    binding_id,
+    actor,
+):
+    """Record that one Plane user has seen the binding's current observation."""
+
+    with transaction.atomic():
+        binding = (
+            IssueChatBinding.objects.select_for_update(of=("self",))
+            .filter(
+                pk=binding_id,
+                workspace__slug=workspace_slug,
+                project_id=project_id,
+                issue_id=issue_id,
+            )
+            .first()
+        )
+        if binding is None:
+            raise IssueChatNotFound
+
+        acknowledgement, created = IssueChatBindingSeen.objects.get_or_create(
+            binding=binding,
+            member=actor,
+            defaults={
+                "workspace": binding.workspace,
+                "project": binding.project,
+                "observed_at": binding.observation_observed_at,
+                "turn_id": binding.observation_turn_id,
+                "created_by_id": actor.id,
+            },
+        )
+        applied = created
+        if not created and (
+            acknowledgement.observed_at != binding.observation_observed_at
+            or acknowledgement.turn_id != binding.observation_turn_id
+        ):
+            acknowledgement.observed_at = binding.observation_observed_at
+            acknowledgement.turn_id = binding.observation_turn_id
+            acknowledgement.save(update_fields=["observed_at", "turn_id", "updated_at"])
+            applied = True
+
+    return IssueChatSeenResult(
+        binding=binding,
+        acknowledgement=acknowledgement,
+        applied=applied,
+    )
+
+
 def sync_issue_chat_binding(
     *,
     workspace_slug,
@@ -849,10 +1340,7 @@ def sync_issue_chat_binding(
     """Idempotently apply one provider cursor to a work item's progress block."""
 
     normalized_progress = normalize_progress(progress)
-    normalized_thread_id = (thread_id or "").strip()
-    if provider == IssueChatBinding.Provider.CODEX:
-        normalized_thread_id = normalize_codex_thread_id(normalized_thread_id) or normalized_thread_id
-    requested_url = normalize_chat_binding_url(provider, normalized_thread_id, url)
+    normalized_thread_id, requested_url = _normalize_binding_identity(provider, thread_id, url)
     requested_title = _normalize_item(title) if title else None
     request_payload = {
         "provider": provider,
@@ -909,41 +1397,15 @@ def sync_issue_chat_binding(
                     )
                 return IssueChatSyncResult(binding=binding, created=False, applied=False)
 
-            link = binding.link
-            if link is not None and link.issue_id != issue.id:
-                raise IssueChatConflict(
-                    "invalid_link",
-                    "The existing visible chat link does not belong to this work item.",
-                )
-            if link is None or link.deleted_at is not None:
-                if requested_url is None:
-                    raise IssueChatInputError("url", "url is required when creating a chat binding.")
-                provider_label = dict(IssueChatBinding.Provider.choices)[provider]
-                link = IssueLink.objects.create(
-                    workspace=issue.workspace,
-                    project=issue.project,
-                    issue=issue,
-                    url=requested_url,
-                    title=requested_title or f"{provider_label} chat",
-                    metadata={
-                        "kind": "chat",
-                        "chat_binding_id": str(binding.id),
-                        "provider": provider,
-                        "thread_id": normalized_thread_id,
-                    },
-                    created_by_id=actor.id,
-                )
-                binding.link = link
-            else:
-                link_updates = {}
-                if requested_url and requested_url != link.url:
-                    link_updates["url"] = requested_url
-                if requested_title is not None and requested_title != link.title:
-                    link_updates["title"] = requested_title
-                if link_updates:
-                    link_updates["updated_at"] = timezone.now()
-                    IssueLink.objects.filter(pk=link.pk).update(**link_updates)
-                    link.refresh_from_db(fields=list(link_updates))
+            link = _ensure_chat_link(
+                binding,
+                issue,
+                actor,
+                provider,
+                normalized_thread_id,
+                requested_url,
+                requested_title,
+            )
 
             updated_description, block_hash = merge_progress_block(
                 issue.description_html,

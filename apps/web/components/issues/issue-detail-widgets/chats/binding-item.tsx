@@ -4,17 +4,30 @@
  * See the LICENSE file for details.
  */
 
+import { Button } from "@makeplane/propel/components/button";
 import { NewTabOutline } from "@makeplane/propel/icons";
-import type { TIssueChatBinding, TIssueChatProgress } from "@plane/types";
+import type { TIssueChatBinding, TIssueChatManualAttention, TIssueChatProgress } from "@plane/types";
+import { cn } from "@plane/utils";
 // local imports
 import {
-  formatIssueChatFreshness,
+  formatIssueChatObservationFreshness,
   getCodexThreadDeepLink,
+  getIssueChatManualAttentionAction,
+  getIssueChatObservationSourceLabel,
+  getIssueChatObservationStateLabel,
+  getIssueChatPlaneReadLabel,
   getIssueChatProviderLabel,
   getSafeIssueChatWebLink,
-  hasIssueChatProgress,
-  normalizeIssueChatProgress,
 } from "./helpers";
+
+type Props = {
+  binding: TIssueChatBinding;
+  disabled: boolean;
+  actionError?: string;
+  pendingAction?: "seen" | "manual_attention";
+  onMarkSeen: () => Promise<void>;
+  onManualAttention: (value: TIssueChatManualAttention) => Promise<void>;
+};
 
 const PROGRESS_GROUPS: { key: keyof TIssueChatProgress; label: string }[] = [
   { key: "done", label: "Done" },
@@ -22,17 +35,17 @@ const PROGRESS_GROUPS: { key: keyof TIssueChatProgress; label: string }[] = [
   { key: "waiting", label: "Waiting" },
 ];
 
-type Props = {
-  binding: TIssueChatBinding;
-};
-
 export function IssueChatBindingItem(props: Props) {
-  const { binding } = props;
-  const progress = normalizeIssueChatProgress(binding.progress);
-  const hasProgress = hasIssueChatProgress(progress);
+  const { binding, disabled, actionError, pendingAction, onMarkSeen, onManualAttention } = props;
   const nativeCodexUrl = binding.provider === "codex" ? getCodexThreadDeepLink(binding.thread_id) : undefined;
   const webLink = getSafeIssueChatWebLink(binding.link?.url);
   const webLinkLabel = binding.link?.title?.trim() || webLink || "Chat link unavailable";
+  const stateLabel = getIssueChatObservationStateLabel(binding.observation_state);
+  const sourceLabel = getIssueChatObservationSourceLabel(binding.observation_source);
+  const planeReadLabel = getIssueChatPlaneReadLabel(binding);
+  const manualAttentionAction = getIssueChatManualAttentionAction(binding);
+  const progress = binding.progress;
+  const hasProgress = PROGRESS_GROUPS.some(({ key }) => Array.isArray(progress?.[key]) && progress[key].length > 0);
 
   return (
     <article className="space-y-3 rounded-md border border-subtle bg-surface-2 p-3">
@@ -71,26 +84,41 @@ export function IssueChatBindingItem(props: Props) {
             {!nativeCodexUrl && !webLink && <p className="text-body-sm-medium text-secondary">Chat link unavailable</p>}
           </div>
         </div>
-        <div className="text-right">
-          <p className="text-11 font-medium text-secondary">{formatIssueChatFreshness(binding.last_synced_at)}</p>
-          <p className="text-10 text-tertiary">Cursor {binding.sync_cursor}</p>
-        </div>
+        <p className="text-11 text-tertiary">{formatIssueChatObservationFreshness(binding.observation_observed_at)}</p>
       </div>
 
-      <div className="rounded-sm bg-surface-1 px-2.5 py-2 text-11 text-secondary">
-        Live sync is unavailable in the web app. This view is read-only and updates after the connected provider session
-        syncs.
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          className={cn(
+            "rounded-sm border px-1.5 py-0.5 text-10 font-medium",
+            binding.attention
+              ? "border-accent-strong/20 bg-accent-primary/10 text-accent-secondary"
+              : "border-subtle bg-surface-1 text-secondary"
+          )}
+        >
+          {stateLabel}
+        </span>
+        {planeReadLabel && (
+          <span className="rounded-sm border border-subtle bg-surface-1 px-1.5 py-0.5 text-10 text-secondary">
+            {planeReadLabel}
+          </span>
+        )}
+        <span className="text-11 text-tertiary">{sourceLabel}</span>
       </div>
 
-      {hasProgress ? (
+      <p className="text-11 text-tertiary">
+        Seen is tracked only in Plane, not in the chat provider. Opening this chat does not mark it seen here.
+      </p>
+
+      {hasProgress && (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-          {PROGRESS_GROUPS.map((group) => (
-            <div key={group.key} className="min-w-0 space-y-1.5">
-              <p className="text-11 font-medium text-tertiary">{group.label}</p>
-              {progress[group.key].length > 0 ? (
+          {PROGRESS_GROUPS.map(({ key, label }) => (
+            <div key={key} className="min-w-0 space-y-1.5">
+              <p className="text-11 font-medium text-tertiary">{label}</p>
+              {progress[key]?.length ? (
                 <ul className="space-y-1">
-                  {progress[group.key].map((item) => (
-                    <li key={`${group.key}-${item}`} className="text-12 break-words text-primary">
+                  {progress[key].map((item) => (
+                    <li key={`${key}-${item}`} className="text-12 break-words text-primary">
                       {item}
                     </li>
                   ))}
@@ -101,8 +129,41 @@ export function IssueChatBindingItem(props: Props) {
             </div>
           ))}
         </div>
-      ) : (
-        <p className="text-11 text-tertiary">No progress has been synced for this chat yet.</p>
+      )}
+
+      {(binding.unread || manualAttentionAction) && (
+        <div className="flex flex-wrap items-center gap-2">
+          {binding.unread && (
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              stretch="auto"
+              label="Mark seen in Plane"
+              loading={pendingAction === "seen"}
+              disabled={disabled || (!!pendingAction && pendingAction !== "seen")}
+              onClick={() => void onMarkSeen()}
+            />
+          )}
+          {manualAttentionAction && (
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              stretch="auto"
+              label={manualAttentionAction.label}
+              loading={pendingAction === "manual_attention"}
+              disabled={disabled || (!!pendingAction && pendingAction !== "manual_attention")}
+              onClick={() => void onManualAttention(manualAttentionAction.value)}
+            />
+          )}
+        </div>
+      )}
+
+      {actionError && (
+        <p role="alert" className="text-11 text-danger-primary">
+          {actionError}
+        </p>
       )}
     </article>
   );

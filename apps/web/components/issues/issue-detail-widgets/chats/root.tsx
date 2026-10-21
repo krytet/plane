@@ -8,7 +8,12 @@ import { useCallback, useEffect, useState } from "react";
 import { observer } from "mobx-react";
 import { AddOutline, RefreshOutline } from "@makeplane/propel/icons";
 import { Collapsible } from "@makeplane/propel/components/collapsible";
-import type { TIssueChatBinding, TIssueChatBindingCreate, TIssueServiceType } from "@plane/types";
+import type {
+  TIssueChatBinding,
+  TIssueChatBindingCreate,
+  TIssueChatManualAttention,
+  TIssueServiceType,
+} from "@plane/types";
 // hooks
 import { useIssueDetail } from "@/hooks/store/use-issue-detail";
 // services
@@ -27,7 +32,10 @@ type Props = {
   issueServiceType: TIssueServiceType;
 };
 
-const getErrorMessage = (error: unknown): string => {
+const getErrorMessage = (
+  error: unknown,
+  fallback = "Could not load chat bindings. The app route may not be available in this deployment yet."
+): string => {
   if (typeof error === "string") return error;
   if (error && typeof error === "object") {
     const data = error as { error?: string; detail?: string; code?: string; [key: string]: unknown };
@@ -39,7 +47,7 @@ const getErrorMessage = (error: unknown): string => {
     );
     if (Array.isArray(fieldError)) return fieldError.find((item): item is string => typeof item === "string") ?? "";
   }
-  return "Could not load chat bindings. The app route may not be available in this deployment yet.";
+  return fallback;
 };
 
 export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props) {
@@ -51,11 +59,17 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
   const [formError, setFormError] = useState<string>();
   const [loadError, setLoadError] = useState<string>();
   const [isFormOpen, setIsFormOpen] = useState(false);
+  const [pendingAction, setPendingAction] = useState<{
+    bindingId: string;
+    action: "seen" | "manual_attention";
+  }>();
+  const [actionErrors, setActionErrors] = useState<Record<string, string>>({});
   const isCollapsibleOpen = openWidgets.includes("chats");
 
   const loadBindings = useCallback(async () => {
     setIsLoading(true);
     setLoadError(undefined);
+    setActionErrors({});
     try {
       const response = await issueChatBindingService.listIssueChatBindings(workspaceSlug, projectId, issueId);
       setBindings(response);
@@ -81,6 +95,64 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
       setFormError(getErrorMessage(error));
     } finally {
       setIsSubmitting(false);
+    }
+  };
+
+  const replaceBinding = (updatedBinding: TIssueChatBinding) => {
+    setBindings((current) => current.map((binding) => (binding.id === updatedBinding.id ? updatedBinding : binding)));
+  };
+
+  const clearBindingActionError = (bindingId: string) => {
+    setActionErrors((current) => {
+      if (!(bindingId in current)) return current;
+      const next = { ...current };
+      delete next[bindingId];
+      return next;
+    });
+  };
+
+  const handleMarkSeen = async (bindingId: string) => {
+    if (disabled || pendingAction) return;
+    setPendingAction({ bindingId, action: "seen" });
+    clearBindingActionError(bindingId);
+    try {
+      const updatedBinding = await issueChatBindingService.markIssueChatBindingSeen(
+        workspaceSlug,
+        projectId,
+        issueId,
+        bindingId
+      );
+      replaceBinding(updatedBinding);
+    } catch (error) {
+      setActionErrors((current) => ({
+        ...current,
+        [bindingId]: getErrorMessage(error, "Could not mark this chat as seen in Plane."),
+      }));
+    } finally {
+      setPendingAction(undefined);
+    }
+  };
+
+  const handleManualAttention = async (bindingId: string, value: TIssueChatManualAttention) => {
+    if (disabled || pendingAction) return;
+    setPendingAction({ bindingId, action: "manual_attention" });
+    clearBindingActionError(bindingId);
+    try {
+      const updatedBinding = await issueChatBindingService.setIssueChatManualAttention(
+        workspaceSlug,
+        projectId,
+        issueId,
+        bindingId,
+        value
+      );
+      replaceBinding(updatedBinding);
+    } catch (error) {
+      setActionErrors((current) => ({
+        ...current,
+        [bindingId]: getErrorMessage(error, "Could not update manual attention."),
+      }));
+    } finally {
+      setPendingAction(undefined);
     }
   };
 
@@ -141,7 +213,17 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
             </button>
           </div>
         ) : bindings.length > 0 ? (
-          bindings.map((binding) => <IssueChatBindingItem key={binding.id} binding={binding} />)
+          bindings.map((binding) => (
+            <IssueChatBindingItem
+              key={binding.id}
+              binding={binding}
+              disabled={disabled}
+              actionError={actionErrors[binding.id]}
+              pendingAction={pendingAction?.bindingId === binding.id ? pendingAction.action : undefined}
+              onMarkSeen={() => handleMarkSeen(binding.id)}
+              onManualAttention={(value) => handleManualAttention(binding.id, value)}
+            />
+          ))
         ) : (
           <p className="text-11 text-tertiary">
             No chat bindings yet. Add a web link, or use a Codex thread UUID for a local deep link.

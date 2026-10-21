@@ -48,6 +48,7 @@ from plane.api.serializers import (
     IssueCommentSerializer,
     IssueChatBindingSerializer,
     IssueChatBindingSyncSerializer,
+    IssueChatObservationSerializer,
     IssueLinkSerializer,
     IssueRelationCreateSerializer,
     IssueRelationResponseSerializer,
@@ -104,6 +105,7 @@ from plane.utils.issue_chat import (
     redact_issue_description_fields,
     scope_issue_links_for_user,
     sync_issue_chat_binding,
+    update_issue_chat_observation,
 )
 from plane.bgtasks.webhook_task import model_activity
 from plane.app.permissions import ROLE, allow_permission
@@ -1576,13 +1578,20 @@ class IssueChatBindingAPIEndpoint(BaseAPIView):
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER])
     def get(self, request, slug, project_id, issue_id):
         try:
-            bindings = list_issue_chat_bindings(slug, project_id, issue_id)
+            bindings = list_issue_chat_bindings(slug, project_id, issue_id, user=request.user)
         except IssueChatNotFound:
             return Response(
                 {"error": "The requested resource does not exist."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        return Response(self.serializer_class(bindings, many=True).data, status=status.HTTP_200_OK)
+        return Response(
+            self.serializer_class(
+                bindings,
+                many=True,
+                context={"request": request},
+            ).data,
+            status=status.HTTP_200_OK,
+        )
 
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER])
     def post(self, request, slug, project_id, issue_id):
@@ -1608,11 +1617,61 @@ class IssueChatBindingAPIEndpoint(BaseAPIView):
         except IssueChatConflict as exc:
             return self._conflict(exc)
 
-        response_data = self.serializer_class(result.binding).data
+        response_data = self.serializer_class(
+            result.binding,
+            context={"request": request},
+        ).data
         response_data["applied"] = result.applied
         return Response(
             response_data,
             status=status.HTTP_201_CREATED if result.created else status.HTTP_200_OK,
+        )
+
+
+class IssueChatObservationAPIEndpoint(BaseAPIView):
+    """API-key-only typed presence observations for an existing Codex binding."""
+
+    permission_classes = [ProjectEntityPermission]
+
+    @staticmethod
+    def _conflict(exc):
+        return Response(
+            {"error": exc.message, "code": exc.code},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    @allow_permission([ROLE.ADMIN, ROLE.MEMBER])
+    def post(self, request, slug, project_id, issue_id, binding_id):
+        serializer = IssueChatObservationSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            result = update_issue_chat_observation(
+                workspace_slug=slug,
+                project_id=project_id,
+                issue_id=issue_id,
+                binding_id=binding_id,
+                **serializer.validated_data,
+            )
+        except IssueChatNotFound:
+            return Response(
+                {"error": "The requested resource does not exist."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except IssueChatInputError as exc:
+            return Response({exc.field: [exc.message]}, status=status.HTTP_400_BAD_REQUEST)
+        except IssueChatConflict as exc:
+            return self._conflict(exc)
+
+        response_data = IssueChatBindingSerializer(
+            result.binding,
+            context={"request": request},
+        ).data
+        response_data["applied"] = result.applied
+        return Response(
+            response_data,
+            status=status.HTTP_200_OK,
         )
 
 

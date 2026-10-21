@@ -31,6 +31,7 @@ from .issue import (
     RelatedIssueSerializer,
     IssueChatBindingSerializer,
     IssueChatBindingSyncSerializer,
+    IssueChatObservationSerializer,
 )
 from .state import StateLiteSerializer, StateSerializer
 from .cycle import (

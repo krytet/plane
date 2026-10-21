@@ -5,7 +5,12 @@
  */
 
 import { API_BASE_URL } from "@plane/constants";
-import type { TIssueChatBinding, TIssueChatBindingCreate, TIssueChatBindingSyncResponse } from "@plane/types";
+import type {
+  TIssueChatBinding,
+  TIssueChatBindingCreate,
+  TIssueChatBindingResponse,
+  TIssueChatManualAttention,
+} from "@plane/types";
 // services
 import { APIService } from "@/services/api.service";
 
@@ -16,6 +21,10 @@ export class IssueChatBindingService extends APIService {
 
   private getPath(workspaceSlug: string, projectId: string, issueId: string) {
     return `/api/workspaces/${workspaceSlug}/projects/${projectId}/issues/${issueId}/chat-bindings/`;
+  }
+
+  private getBindingPath(workspaceSlug: string, projectId: string, issueId: string, bindingId: string) {
+    return `${this.getPath(workspaceSlug, projectId, issueId)}${bindingId}/`;
   }
 
   async listIssueChatBindings(workspaceSlug: string, projectId: string, issueId: string): Promise<TIssueChatBinding[]> {
@@ -31,20 +40,37 @@ export class IssueChatBindingService extends APIService {
     projectId: string,
     issueId: string,
     data: TIssueChatBindingCreate
-  ): Promise<TIssueChatBindingSyncResponse> {
-    // The visible form only collects binding metadata. An initial cursor with empty
-    // progress keeps the app route compatible with the existing idempotent sync contract.
-    const payload = {
-      ...data,
-      cursor: 1,
-      progress: {
-        done: [],
-        now: [],
-        waiting: [],
-      },
-    };
+  ): Promise<TIssueChatBindingResponse> {
+    return this.post(this.getPath(workspaceSlug, projectId, issueId), data)
+      .then((response) => response?.data)
+      .catch((error) => {
+        throw error?.response?.data;
+      });
+  }
 
-    return this.post(this.getPath(workspaceSlug, projectId, issueId), payload)
+  async markIssueChatBindingSeen(
+    workspaceSlug: string,
+    projectId: string,
+    issueId: string,
+    bindingId: string
+  ): Promise<TIssueChatBindingResponse> {
+    return this.post(`${this.getBindingPath(workspaceSlug, projectId, issueId, bindingId)}seen/`, {})
+      .then((response) => response?.data)
+      .catch((error) => {
+        throw error?.response?.data;
+      });
+  }
+
+  async setIssueChatManualAttention(
+    workspaceSlug: string,
+    projectId: string,
+    issueId: string,
+    bindingId: string,
+    manualAttention: TIssueChatManualAttention
+  ): Promise<TIssueChatBindingResponse> {
+    return this.post(`${this.getBindingPath(workspaceSlug, projectId, issueId, bindingId)}manual-attention/`, {
+      manual_attention: manualAttention,
+    })
       .then((response) => response?.data)
       .catch((error) => {
         throw error?.response?.data;

@@ -140,7 +140,11 @@ from .issue.attachment import (
 )
 
 from .issue.comment import IssueCommentViewSet, CommentReactionViewSet
-from .issue.chat import IssueChatBindingEndpoint
+from .issue.chat import (
+    IssueChatBindingEndpoint,
+    IssueChatBindingSeenEndpoint,
+    IssueChatManualAttentionEndpoint,
+)
 
 from .issue.label import LabelViewSet, BulkCreateIssueLabelsEndpoint
 

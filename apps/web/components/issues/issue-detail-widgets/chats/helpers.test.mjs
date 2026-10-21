@@ -2,41 +2,55 @@ import assert from "node:assert/strict";
 import test from "node:test";
 // local imports
 import {
-  formatIssueChatFreshness,
+  formatIssueChatObservationFreshness,
+  getIssueChatManualAttentionAction,
+  getIssueChatObservationSourceLabel,
+  getIssueChatObservationStateLabel,
+  getIssueChatPlaneReadLabel,
   getCodexThreadDeepLink,
   getIssueChatBindingUrlValidationError,
   getIssueChatUrlValidationError,
   getIssueChatProviderLabel,
   getSafeIssueChatWebLink,
-  hasIssueChatProgress,
   isValidIssueChatUrl,
-  normalizeIssueChatProgress,
 } from "./helpers.ts";
 
-test("normalizes and detects chat progress", () => {
-  const progress = normalizeIssueChatProgress({
-    done: ["Shipped", "  "],
-    now: ["Review"],
-    waiting: [],
-  });
-
-  assert.deepEqual(progress, {
-    done: ["Shipped"],
-    now: ["Review"],
-    waiting: [],
-  });
-  assert.equal(hasIssueChatProgress(progress), true);
-  assert.equal(hasIssueChatProgress({ done: [], now: ["  "], waiting: [] }), false);
+test("labels observations and their source without claiming provider read state", () => {
+  assert.equal(getIssueChatObservationStateLabel("answer_available"), "Answer available");
+  assert.equal(getIssueChatObservationStateLabel("needs_action"), "Needs action");
+  assert.equal(getIssueChatObservationStateLabel("failed"), "Failed");
+  assert.equal(getIssueChatObservationStateLabel("unknown"), "No reported state");
+  assert.equal(getIssueChatObservationSourceLabel("codex"), "Codex observation");
+  assert.equal(getIssueChatObservationSourceLabel("manual"), "Marked manually in Plane");
+  assert.equal(getIssueChatObservationSourceLabel(null), "Source not reported");
+  assert.equal(getIssueChatPlaneReadLabel({ attention: true, unread: true, seen_at: null }), "Unread in Plane");
+  assert.equal(
+    getIssueChatPlaneReadLabel({ attention: true, unread: false, seen_at: "2026-10-21T12:00:00Z" }),
+    "Seen in Plane"
+  );
+  assert.equal(getIssueChatPlaneReadLabel({ attention: false, unread: false, seen_at: null }), undefined);
 });
 
-test("formats freshness without claiming a sync for null timestamps", () => {
+test("formats observation freshness without implying automatic sync", () => {
   const now = Date.parse("2026-10-21T12:00:00Z");
 
-  assert.equal(formatIssueChatFreshness(null, now), "Not synced yet");
-  assert.equal(formatIssueChatFreshness("invalid", now), "Sync time unavailable");
-  assert.equal(formatIssueChatFreshness("2026-10-21T11:59:45Z", now), "Synced just now");
-  assert.equal(formatIssueChatFreshness("2026-10-21T10:00:00Z", now), "Synced 2 hours ago");
-  assert.equal(formatIssueChatFreshness("2026-10-19T12:00:00Z", now), "Synced 2 days ago");
+  assert.equal(formatIssueChatObservationFreshness(null, now), "No observation yet");
+  assert.equal(formatIssueChatObservationFreshness("invalid", now), "Observation time unavailable");
+  assert.equal(formatIssueChatObservationFreshness("2026-10-21T11:59:45Z", now), "Observed just now");
+  assert.equal(formatIssueChatObservationFreshness("2026-10-21T10:00:00Z", now), "Observed 2 hours ago");
+  assert.equal(formatIssueChatObservationFreshness("2026-10-19T12:00:00Z", now), "Observed 2 days ago");
+});
+
+test("offers manual attention only for ChatGPT bindings", () => {
+  assert.deepEqual(getIssueChatManualAttentionAction({ provider: "chatgpt", manual_attention: false }), {
+    label: "Mark needs action",
+    value: "needs_action",
+  });
+  assert.deepEqual(getIssueChatManualAttentionAction({ provider: "chatgpt", manual_attention: true }), {
+    label: "Clear manual attention",
+    value: "clear",
+  });
+  assert.equal(getIssueChatManualAttentionAction({ provider: "codex", manual_attention: false }), null);
 });
 
 test("matches the backend provider URL contract", () => {

@@ -10,6 +10,7 @@ from plane.api.views import (
     IssueLinkListCreateAPIEndpoint,
     IssueLinkDetailAPIEndpoint,
     IssueChatBindingAPIEndpoint,
+    IssueChatObservationAPIEndpoint,
     IssueCommentListCreateAPIEndpoint,
     IssueCommentDetailAPIEndpoint,
     IssueActivityListAPIEndpoint,
@@ -126,6 +127,11 @@ new_url_patterns = [
         "workspaces/<str:slug>/projects/<uuid:project_id>/work-items/<uuid:issue_id>/chat-bindings/",
         IssueChatBindingAPIEndpoint.as_view(http_method_names=["get", "post"]),
         name="work-item-chat-binding",
+    ),
+    path(
+        "workspaces/<str:slug>/projects/<uuid:project_id>/work-items/<uuid:issue_id>/chat-bindings/<uuid:binding_id>/observations/",
+        IssueChatObservationAPIEndpoint.as_view(http_method_names=["post"]),
+        name="work-item-chat-binding-observation",
     ),
     path(
         "workspaces/<str:slug>/projects/<uuid:project_id>/work-items/<uuid:issue_id>/comments/",
