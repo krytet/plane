@@ -13,6 +13,7 @@ from rest_framework.test import APIClient
 from plane.db.models import (
     APIToken,
     Issue,
+    IssueActivity,
     IssueChatBinding,
     IssueLink,
     Project,
@@ -70,6 +71,20 @@ def _url(workspace, issue):
 
 def _work_item_url(workspace, issue):
     return f"/api/v1/workspaces/{workspace.slug}/projects/{issue.project_id}/work-items/{issue.id}/"
+
+
+def _links_url(workspace, issue):
+    return f"{_work_item_url(workspace, issue)}links/"
+
+
+def _activities_url(workspace, issue):
+    return f"{_work_item_url(workspace, issue)}activities/"
+
+
+def _result_rows(response):
+    if isinstance(response.data, dict) and "results" in response.data:
+        return response.data["results"]
+    return response.data
 
 
 def _payload(cursor=1, now=None):
@@ -418,3 +433,87 @@ def test_api_guest_work_item_list_and_detail_redact_generated_progress(tenant):
     assert "Backend model" not in guest_detail_html
     assert "Focused tests" not in guest_detail_html
     assert "chat-progress" not in guest_detail_html
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_api_generic_links_hide_managed_chat_links_from_guests(tenant):
+    issue = tenant["issue"]
+    synced = tenant["client"].post(_url(tenant["workspace"], issue), _payload(cursor=1), format="json")
+    assert synced.status_code == status.HTTP_201_CREATED, synced.content
+    binding = IssueChatBinding.objects.get(pk=synced.data["id"])
+    regular_link = IssueLink.objects.create(
+        workspace=tenant["workspace"],
+        project=tenant["project"],
+        issue=issue,
+        url="https://example.com/api-regular-link",
+        title="Regular API link",
+        metadata={"source": "manual"},
+    )
+    links_url = _links_url(tenant["workspace"], issue)
+
+    owner_list = tenant["client"].get(links_url)
+    assert owner_list.status_code == status.HTTP_200_OK, owner_list.content
+    assert {row["url"] for row in _result_rows(owner_list)} == {binding.link.url, regular_link.url}
+
+    tenant["project"].guest_view_all_features = True
+    tenant["project"].save(update_fields=["guest_view_all_features"])
+    guest = _user("api-link-guest")
+    WorkspaceMember.objects.create(workspace=tenant["workspace"], member=guest, role=5)
+    ProjectMember.objects.create(project=tenant["project"], workspace=tenant["workspace"], member=guest, role=5)
+    guest_client = _client_for(guest)
+
+    guest_list = guest_client.get(links_url)
+    assert guest_list.status_code == status.HTTP_200_OK, guest_list.content
+    assert {row["url"] for row in _result_rows(guest_list)} == {regular_link.url}
+    assert guest_client.get(f"{links_url}{binding.link_id}/").status_code == status.HTTP_404_NOT_FOUND
+    regular_detail = guest_client.get(f"{links_url}{regular_link.id}/")
+    assert regular_detail.status_code == status.HTTP_200_OK, regular_detail.content
+    assert regular_detail.data["url"] == regular_link.url
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_api_activity_list_and_detail_redact_managed_progress_for_guests(tenant):
+    issue = tenant["issue"]
+    synced = tenant["client"].post(_url(tenant["workspace"], issue), _payload(cursor=1), format="json")
+    assert synced.status_code == status.HTTP_201_CREATED, synced.content
+    issue.refresh_from_db()
+    activity = IssueActivity.objects.create(
+        issue=issue,
+        workspace=tenant["workspace"],
+        project=tenant["project"],
+        actor=tenant["owner"],
+        verb="updated",
+        field="description",
+        old_value="<p>Old API manual.</p>",
+        new_value=issue.description_html,
+    )
+    activities_url = _activities_url(tenant["workspace"], issue)
+    detail_url = f"{activities_url}{activity.id}/"
+
+    owner_list = tenant["client"].get(activities_url)
+    owner_detail = tenant["client"].get(detail_url)
+    assert owner_list.status_code == status.HTTP_200_OK, owner_list.content
+    assert owner_detail.status_code == status.HTTP_200_OK, owner_detail.content
+    assert "Backend model" in str(owner_list.data)
+    assert "Backend model" in owner_detail.data["new_value"]
+
+    tenant["project"].guest_view_all_features = True
+    tenant["project"].save(update_fields=["guest_view_all_features"])
+    guest = _user("api-activity-guest")
+    WorkspaceMember.objects.create(workspace=tenant["workspace"], member=guest, role=5)
+    ProjectMember.objects.create(project=tenant["project"], workspace=tenant["workspace"], member=guest, role=5)
+    guest_client = _client_for(guest)
+
+    guest_list = guest_client.get(activities_url)
+    guest_detail = guest_client.get(detail_url)
+    assert guest_list.status_code == status.HTTP_200_OK, guest_list.content
+    assert guest_detail.status_code == status.HTTP_200_OK, guest_detail.content
+    guest_serialized = str(guest_list.data)
+    guest_detail_serialized = str(guest_detail.data)
+    assert "Old API manual." in guest_detail.data["old_value"]
+    for value in (guest_serialized, guest_detail_serialized):
+        assert "Backend model" not in value
+        assert "Focused tests" not in value
+        assert "chat-progress" not in value

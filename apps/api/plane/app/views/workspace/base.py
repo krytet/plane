@@ -49,6 +49,7 @@ from plane.license.utils.instance_value import get_configuration_value
 from plane.bgtasks.workspace_seed_task import workspace_seed
 from plane.utils.url import contains_url
 from plane.utils.csv_utils import sanitize_csv_row
+from plane.utils.issue_chat import issue_activity_chat_progress_context, redact_issue_activity_fields
 
 
 class WorkSpaceViewSet(BaseViewSet):
@@ -352,13 +353,17 @@ class ExportWorkspaceUserActivityEndpoint(BaseAPIView):
         if not request.data.get("date"):
             return Response({"error": "Date is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        user_activities = IssueActivity.objects.filter(
-            ~Q(field__in=["comment", "vote", "reaction", "draft"]),
-            _visible_issues_q(request.user, prefix="issue__"),
-            workspace__slug=slug,
-            created_at__date=request.data.get("date"),
-            actor_id=user_id,
-        ).select_related("actor", "workspace", "issue", "project")[:10000]
+        user_activities = list(
+            IssueActivity.objects.filter(
+                ~Q(field__in=["comment", "vote", "reaction", "draft"]),
+                _visible_issues_q(request.user, prefix="issue__"),
+                workspace__slug=slug,
+                created_at__date=request.data.get("date"),
+                actor_id=user_id,
+            ).select_related("actor", "workspace", "issue", "project")[:10000]
+        )
+        activity_context = issue_activity_chat_progress_context(request.user, user_activities)
+        redacted_project_ids = activity_context["redact_chat_progress_project_ids"]
 
         header = [
             "Actor name",
@@ -371,20 +376,27 @@ class ExportWorkspaceUserActivityEndpoint(BaseAPIView):
             "Old value",
             "New value",
         ]
-        rows = [
-            (
-                activity.actor.display_name,
-                f"{activity.project.identifier} - {activity.issue.sequence_id if activity.issue else ''}",
-                activity.project.name,
-                activity.created_at,
-                activity.updated_at,
-                activity.verb,
-                activity.field,
-                activity.old_value,
-                activity.new_value,
+        rows = []
+        for activity in user_activities:
+            values = {
+                "old_value": activity.old_value,
+                "new_value": activity.new_value,
+            }
+            if str(activity.project_id) in redacted_project_ids:
+                redact_issue_activity_fields(values)
+            rows.append(
+                (
+                    activity.actor.display_name,
+                    f"{activity.project.identifier} - {activity.issue.sequence_id if activity.issue else ''}",
+                    activity.project.name,
+                    activity.created_at,
+                    activity.updated_at,
+                    activity.verb,
+                    activity.field,
+                    values["old_value"],
+                    values["new_value"],
+                )
             )
-            for activity in user_activities
-        ]
         csv_buffer = self.generate_csv_from_rows([header] + rows)
         response = HttpResponse(csv_buffer.getvalue(), content_type="text/csv")
         response["Content-Disposition"] = 'attachment; filename="workspace-user-activity.csv"'

@@ -21,6 +21,7 @@ from plane.db.models import Issue, IssueLink
 from plane.bgtasks.issue_activities_task import issue_activity
 from plane.bgtasks.work_item_link_task import crawl_work_item_link_title
 from plane.utils.host import base_host
+from plane.utils.issue_chat import scope_issue_links_for_user
 
 
 class IssueLinkViewSet(BaseViewSet):
@@ -30,7 +31,7 @@ class IssueLinkViewSet(BaseViewSet):
     serializer_class = IssueLinkSerializer
 
     def get_queryset(self):
-        return (
+        queryset = (
             super()
             .get_queryset()
             .filter(workspace__slug=self.kwargs.get("slug"))
@@ -43,6 +44,12 @@ class IssueLinkViewSet(BaseViewSet):
             )
             .order_by("-created_at")
             .distinct()
+        )
+        return scope_issue_links_for_user(
+            queryset,
+            self.request.user,
+            self.kwargs.get("slug"),
+            self.kwargs.get("project_id"),
         )
 
     def create(self, request, slug, project_id, issue_id):
@@ -71,7 +78,7 @@ class IssueLinkViewSet(BaseViewSet):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     def partial_update(self, request, slug, project_id, issue_id, pk):
-        issue_link = IssueLink.objects.get(workspace__slug=slug, project_id=project_id, issue_id=issue_id, pk=pk)
+        issue_link = self.get_queryset().get(pk=pk)
         requested_data = json.dumps(request.data, cls=DjangoJSONEncoder)
         current_instance = json.dumps(IssueLinkSerializer(issue_link).data, cls=DjangoJSONEncoder)
 
@@ -102,7 +109,7 @@ class IssueLinkViewSet(BaseViewSet):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     def destroy(self, request, slug, project_id, issue_id, pk):
-        issue_link = IssueLink.objects.get(workspace__slug=slug, project_id=project_id, issue_id=issue_id, pk=pk)
+        issue_link = self.get_queryset().get(pk=pk)
         current_instance = json.dumps(IssueLinkSerializer(issue_link).data, cls=DjangoJSONEncoder)
         issue_activity.delay(
             type="link.activity.deleted",

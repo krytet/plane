@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 from django.db import IntegrityError
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 
@@ -23,6 +24,7 @@ from plane.db.models import (
     Workspace,
     WorkspaceMember,
 )
+from plane.utils.issue_chat import progress_block_id, scope_issue_links_for_user
 
 
 def _user(prefix):
@@ -91,6 +93,12 @@ def _url(workspace, issue):
 
 def _issue_url(workspace, issue):
     return f"/api/workspaces/{workspace.slug}/projects/{issue.project_id}/issues/{issue.id}/"
+
+
+def _result_rows(response):
+    if isinstance(response.data, dict) and "results" in response.data:
+        return response.data["results"]
+    return response.data
 
 
 @pytest.fixture
@@ -602,3 +610,191 @@ def test_guest_history_redacts_generated_progress_values_and_issue_detail(tenant
     assert "Backend model" not in serialized
     assert "Focused tests" not in serialized
     assert "chat-progress" not in serialized
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_generic_issue_link_reads_hide_managed_chat_links_from_guests(tenant):
+    issue = tenant["issue"]
+    synced = tenant["client"].post(_url(tenant["workspace"], issue), _payload(cursor=1), format="json")
+    assert synced.status_code == status.HTTP_201_CREATED, synced.content
+    binding = IssueChatBinding.objects.get(pk=synced.data["id"])
+    regular_link = IssueLink.objects.create(
+        workspace=tenant["workspace"],
+        project=tenant["project"],
+        issue=issue,
+        url="https://example.com/regular-link",
+        title="Regular link",
+        metadata={"source": "manual"},
+    )
+    links_url = f"/api/workspaces/{tenant['workspace'].slug}/projects/{issue.project_id}/issues/{issue.id}/issue-links/"
+
+    owner_list = tenant["client"].get(links_url)
+    owner_urls = {row["url"] for row in _result_rows(owner_list)}
+    assert owner_list.status_code == status.HTTP_200_OK, owner_list.content
+    assert owner_urls == {binding.link.url, regular_link.url}
+
+    tenant["project"].guest_view_all_features = True
+    tenant["project"].save(update_fields=["guest_view_all_features"])
+    guest = _user("link-guest")
+    WorkspaceMember.objects.create(workspace=tenant["workspace"], member=guest, role=5)
+    ProjectMember.objects.create(project=tenant["project"], workspace=tenant["workspace"], member=guest, role=5)
+    guest_client = APIClient()
+    guest_client.force_login(guest)
+
+    guest_link_scope = IssueLink.objects.filter(
+        workspace__slug=tenant["workspace"].slug,
+        project_id=tenant["project"].id,
+        issue_id=issue.id,
+        project__project_projectmember__member=guest,
+        project__project_projectmember__is_active=True,
+    )
+    assert set(guest_link_scope.values_list("url", flat=True)) == {
+        binding.link.url,
+        regular_link.url,
+    }
+    scoped_links = scope_issue_links_for_user(
+        guest_link_scope,
+        guest,
+        tenant["workspace"].slug,
+        tenant["project"].id,
+    )
+    assert set(scoped_links.values_list("url", flat=True)) == {regular_link.url}
+
+    guest_list = guest_client.get(links_url)
+    guest_urls = {row["url"] for row in _result_rows(guest_list)}
+    assert guest_list.status_code == status.HTTP_200_OK, guest_list.content
+    assert guest_urls == {regular_link.url}
+
+    hidden_detail = guest_client.get(f"{links_url}{binding.link_id}/")
+    regular_detail = guest_client.get(f"{links_url}{regular_link.id}/")
+    assert hidden_detail.status_code == status.HTTP_404_NOT_FOUND
+    assert regular_detail.status_code == status.HTTP_200_OK, regular_detail.content
+    assert regular_detail.data["url"] == regular_link.url
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+@pytest.mark.parametrize("http_method", ["patch", "put"])
+def test_json_only_issue_update_keeps_latest_managed_progress(tenant, http_method):
+    issue = tenant["issue"]
+    payload = _payload(cursor=1)
+    first = tenant["client"].post(_url(tenant["workspace"], issue), payload, format="json")
+    assert first.status_code == status.HTTP_201_CREATED, first.content
+    binding = IssueChatBinding.objects.get(pk=first.data["id"])
+
+    stale_json = {
+        "type": "doc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Manual JSON text."}]},
+            {
+                "type": "chatProgress",
+                "attrs": {"id": progress_block_id(binding.id), "progress": binding.progress},
+            },
+        ],
+    }
+    Issue.all_objects.filter(pk=issue.pk).update(description_json=stale_json)
+    second = tenant["client"].post(
+        _url(tenant["workspace"], issue),
+        {**payload, "cursor": 2, "progress": {**payload["progress"], "now": ["Latest JSON work"]}},
+        format="json",
+    )
+    assert second.status_code == status.HTTP_200_OK, second.content
+
+    with (
+        mock.patch("plane.app.views.issue.base.issue_activity.delay"),
+        mock.patch("plane.app.views.issue.base.model_activity.delay"),
+        mock.patch("plane.app.views.issue.base.issue_description_version_task.delay"),
+    ):
+        response = getattr(tenant["client"], http_method)(
+            _issue_url(tenant["workspace"], issue),
+            {"description_json": stale_json},
+            format="json",
+        )
+
+    assert response.status_code in (status.HTTP_200_OK, status.HTTP_204_NO_CONTENT), response.content
+    issue.refresh_from_db()
+    json_nodes = [
+        node for node in issue.description_json.get("content", []) if node.get("type") == "chatProgress"
+    ]
+    assert len(json_nodes) == 1
+    assert json_nodes[0]["attrs"]["progress"]["now"] == ["Latest JSON work"]
+    assert any(
+        node.get("type") == "paragraph"
+        and node.get("content", [{}])[0].get("text") == "Manual JSON text."
+        for node in issue.description_json.get("content", [])
+    )
+    assert "Latest JSON work" in issue.description_html
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_activity_feeds_and_csv_redact_managed_progress_for_guests(tenant):
+    issue = tenant["issue"]
+    synced = tenant["client"].post(_url(tenant["workspace"], issue), _payload(cursor=1), format="json")
+    assert synced.status_code == status.HTTP_201_CREATED, synced.content
+    issue.refresh_from_db()
+    owner_activity = IssueActivity.objects.create(
+        issue=issue,
+        workspace=tenant["workspace"],
+        project=tenant["project"],
+        actor=tenant["owner"],
+        verb="updated",
+        field="description",
+        old_value="<p>Old manual.</p>",
+        new_value=issue.description_html,
+    )
+
+    tenant["project"].guest_view_all_features = True
+    tenant["project"].save(update_fields=["guest_view_all_features"])
+    guest = _user("feed-activity-guest")
+    WorkspaceMember.objects.create(workspace=tenant["workspace"], member=guest, role=15)
+    ProjectMember.objects.create(project=tenant["project"], workspace=tenant["workspace"], member=guest, role=5)
+    guest_client = APIClient()
+    guest_client.force_login(guest)
+    IssueActivity.objects.create(
+        issue=issue,
+        workspace=tenant["workspace"],
+        project=tenant["project"],
+        actor=guest,
+        verb="updated",
+        field="description",
+        old_value="<p>Old guest manual.</p>",
+        new_value=issue.description_html,
+    )
+
+    workspace_activity_url = (
+        f"/api/workspaces/{tenant['workspace'].slug}/user-activity/{tenant['owner'].id}/"
+    )
+    owner_feed = tenant["client"].get(workspace_activity_url)
+    owner_serialized = str(_result_rows(owner_feed))
+    assert owner_feed.status_code == status.HTTP_200_OK, owner_feed.content
+    assert "Backend model" in owner_serialized
+    assert any(str(row["id"]) == str(owner_activity.id) for row in _result_rows(owner_feed))
+
+    guest_feed = guest_client.get(workspace_activity_url)
+    guest_serialized = str(_result_rows(guest_feed))
+    assert guest_feed.status_code == status.HTTP_200_OK, guest_feed.content
+    assert "Manual description." in guest_serialized
+    assert "Backend model" not in guest_serialized
+    assert "Focused tests" not in guest_serialized
+    assert "chat-progress" not in guest_serialized
+
+    user_feed = guest_client.get("/api/users/me/activities/")
+    user_serialized = str(_result_rows(user_feed))
+    assert user_feed.status_code == status.HTTP_200_OK, user_feed.content
+    assert "Backend model" not in user_serialized
+    assert "Focused tests" not in user_serialized
+    assert "chat-progress" not in user_serialized
+
+    export_url = f"{workspace_activity_url}export/"
+    csv_response = guest_client.post(
+        export_url,
+        {"date": str(timezone.localdate())},
+        format="json",
+    )
+    csv_content = csv_response.content.decode()
+    assert csv_response.status_code == status.HTTP_200_OK, csv_content
+    assert "Backend model" not in csv_content
+    assert "Focused tests" not in csv_content
+    assert "chat-progress" not in csv_content

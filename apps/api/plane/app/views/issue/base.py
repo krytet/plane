@@ -648,7 +648,9 @@ class IssueViewSet(BaseViewSet):
         queryset = self.apply_annotations(queryset)
 
         skip_activity = request.data.pop("skip_activity", False)
-        is_description_update = request.data.get("description_html") is not None
+        is_description_update = any(
+            field in request.data for field in ("description_html", "description_json")
+        )
 
         issue = (
             queryset.annotate(
@@ -712,8 +714,12 @@ class IssueViewSet(BaseViewSet):
                         current_instance = json.dumps(IssueDetailSerializer(issue).data, cls=DjangoJSONEncoder)
                         merged_description, merged_description_json = merge_latest_chat_description(
                             issue,
-                            serializer.validated_data["description_html"],
-                            serializer.validated_data.get("description_json"),
+                            serializer.validated_data.get("description_html", issue.description_html),
+                            (
+                                serializer.validated_data.get("description_json")
+                                if "description_json" in serializer.validated_data
+                                else None
+                            ),
                         )
                         serializer.instance = issue
                         serializer.validated_data["description_html"] = merged_description

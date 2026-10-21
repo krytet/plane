@@ -46,6 +46,7 @@ from plane.db.models import (
 from plane.license.models import Instance, InstanceAdmin
 from plane.utils.paginator import BasePaginator
 from plane.utils.order_queryset import ACTIVITY_ORDER_BY_ALLOWLIST, sanitize_order_by
+from plane.utils.issue_chat import issue_activity_chat_progress_context
 from plane.authentication.utils.host import user_ip
 from plane.bgtasks.user_deactivation_email_task import user_deactivation_email
 from plane.utils.host import base_host
@@ -418,7 +419,11 @@ class UserActivityEndpoint(BaseAPIView, BasePaginator):
             ),
             request=request,
             queryset=queryset,
-            on_results=lambda issue_activities: IssueActivitySerializer(issue_activities, many=True).data,
+            on_results=lambda issue_activities: IssueActivitySerializer(
+                issue_activities,
+                many=True,
+                context=issue_activity_chat_progress_context(request.user, issue_activities),
+            ).data,
         )
 
 

@@ -47,7 +47,12 @@ from plane.utils.content_validator import (
     validate_html_content,
     validate_binary_data,
 )
-from plane.utils.issue_chat import redact_issue_activity_fields, redact_issue_description_fields
+from plane.utils.issue_chat import (
+    IssueChatConflict,
+    redact_issue_activity_fields,
+    redact_issue_description_fields,
+    reject_managed_chat_progress,
+)
 
 
 class IssueFlatSerializer(BaseSerializer):
@@ -156,6 +161,15 @@ class IssueCreateSerializer(BaseSerializer):
             is_valid, error_msg = validate_binary_data(attrs["description_binary"])
             if not is_valid:
                 raise serializers.ValidationError({"description_binary": "Invalid binary data"})
+
+        if self.instance is None:
+            try:
+                reject_managed_chat_progress(
+                    attrs.get("description_html"),
+                    attrs.get("description_json"),
+                )
+            except IssueChatConflict as exc:
+                raise serializers.ValidationError({"description": [exc.message]}) from exc
 
         # Validate assignees are from project
         if attrs.get("assignee_ids", []):
@@ -359,7 +373,12 @@ class IssueActivitySerializer(BaseSerializer):
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        if self.context.get("can_view_chat_progress", True) is False:
+        redacted_project_ids = self.context.get("redact_chat_progress_project_ids")
+        if redacted_project_ids is not None:
+            should_redact = str(instance.project_id) in redacted_project_ids
+        else:
+            should_redact = self.context.get("can_view_chat_progress", True) is False
+        if should_redact:
             redact_issue_activity_fields(data)
         return data
 

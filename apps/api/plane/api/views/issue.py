@@ -102,6 +102,7 @@ from plane.utils.issue_chat import (
     list_issue_chat_bindings,
     merge_latest_chat_description,
     redact_issue_description_fields,
+    scope_issue_links_for_user,
     sync_issue_chat_binding,
 )
 from plane.bgtasks.webhook_task import model_activity
@@ -735,7 +736,10 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                     merged_description = None
                     merged_description_json = None
                     try:
-                        if "description_html" in serializer.validated_data:
+                        if any(
+                            field in serializer.validated_data
+                            for field in ("description_html", "description_json")
+                        ):
                             with transaction.atomic():
                                 issue = (
                                     Issue.objects.select_for_update(of=("self",))
@@ -753,8 +757,15 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                                 )
                                 merged_description, merged_description_json = merge_latest_chat_description(
                                     issue,
-                                    serializer.validated_data["description_html"],
-                                    serializer.validated_data.get("description_json"),
+                                    serializer.validated_data.get(
+                                        "description_html",
+                                        issue.description_html,
+                                    ),
+                                    (
+                                        serializer.validated_data.get("description_json")
+                                        if "description_json" in serializer.validated_data
+                                        else None
+                                    ),
                                 )
                                 serializer.instance = issue
                                 serializer.validated_data["description_html"] = merged_description
@@ -927,7 +938,10 @@ class IssueDetailAPIEndpoint(BaseAPIView):
             merged_description = None
             merged_description_json = None
             try:
-                if "description_html" in serializer.validated_data:
+                if any(
+                    field in serializer.validated_data
+                    for field in ("description_html", "description_json")
+                ):
                     with transaction.atomic():
                         issue = (
                             Issue.objects.select_for_update(of=("self",))
@@ -942,8 +956,15 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                         current_instance = json.dumps(IssueSerializer(issue).data, cls=DjangoJSONEncoder)
                         merged_description, merged_description_json = merge_latest_chat_description(
                             issue,
-                            serializer.validated_data["description_html"],
-                            serializer.validated_data.get("description_json"),
+                            serializer.validated_data.get(
+                                "description_html",
+                                issue.description_html,
+                            ),
+                            (
+                                serializer.validated_data.get("description_json")
+                                if "description_json" in serializer.validated_data
+                                else None
+                            ),
                         )
                         serializer.instance = issue
                         serializer.validated_data["description_html"] = merged_description
@@ -1285,7 +1306,7 @@ class IssueLinkListCreateAPIEndpoint(BaseAPIView):
     use_read_replica = True
 
     def get_queryset(self):
-        return (
+        queryset = (
             IssueLink.objects.filter(workspace__slug=self.kwargs.get("slug"))
             .filter(project_id=self.kwargs.get("project_id"))
             .filter(issue_id=self.kwargs.get("issue_id"))
@@ -1296,6 +1317,12 @@ class IssueLinkListCreateAPIEndpoint(BaseAPIView):
             .filter(project__archived_at__isnull=True)
             .order_by(self.kwargs.get("order_by", "-created_at"))
             .distinct()
+        )
+        return scope_issue_links_for_user(
+            queryset,
+            self.request.user,
+            self.kwargs.get("slug"),
+            self.kwargs.get("project_id"),
         )
 
     @issue_link_docs(
@@ -1391,7 +1418,7 @@ class IssueLinkDetailAPIEndpoint(BaseAPIView):
     use_read_replica = True
 
     def get_queryset(self):
-        return (
+        queryset = (
             IssueLink.objects.filter(workspace__slug=self.kwargs.get("slug"))
             .filter(project_id=self.kwargs.get("project_id"))
             .filter(issue_id=self.kwargs.get("issue_id"))
@@ -1402,6 +1429,12 @@ class IssueLinkDetailAPIEndpoint(BaseAPIView):
             .filter(project__archived_at__isnull=True)
             .order_by(self.kwargs.get("order_by", "-created_at"))
             .distinct()
+        )
+        return scope_issue_links_for_user(
+            queryset,
+            self.request.user,
+            self.kwargs.get("slug"),
+            self.kwargs.get("project_id"),
         )
 
     @issue_link_docs(
@@ -1471,7 +1504,7 @@ class IssueLinkDetailAPIEndpoint(BaseAPIView):
         Modify the URL, title, or metadata of an existing issue link.
         Tracks all changes in issue activity logs.
         """
-        issue_link = IssueLink.objects.get(workspace__slug=slug, project_id=project_id, issue_id=issue_id, pk=pk)
+        issue_link = self.get_queryset().get(pk=pk)
         requested_data = json.dumps(request.data, cls=DjangoJSONEncoder)
         current_instance = json.dumps(IssueLinkSerializer(issue_link).data, cls=DjangoJSONEncoder)
         previous_url = issue_link.url
@@ -1512,7 +1545,7 @@ class IssueLinkDetailAPIEndpoint(BaseAPIView):
         Permanently remove an external link from a work item.
         Records deletion activity for audit purposes.
         """
-        issue_link = IssueLink.objects.get(workspace__slug=slug, project_id=project_id, issue_id=issue_id, pk=pk)
+        issue_link = self.get_queryset().get(pk=pk)
         current_instance = json.dumps(IssueLinkSerializer(issue_link).data, cls=DjangoJSONEncoder)
         issue_activity.delay(
             type="link.activity.deleted",
@@ -1960,7 +1993,13 @@ class IssueActivityListAPIEndpoint(BaseAPIView):
             request=request,
             queryset=(issue_activities),
             on_results=lambda issue_activity: (
-                IssueActivitySerializer(issue_activity, many=True, fields=self.fields, expand=self.expand).data
+                IssueActivitySerializer(
+                    issue_activity,
+                    many=True,
+                    fields=self.fields,
+                    expand=self.expand,
+                    context=_issue_chat_progress_context(request.user, slug, project_id),
+                ).data
             ),
         )
 
@@ -2021,7 +2060,12 @@ class IssueActivityDetailAPIEndpoint(BaseAPIView):
             return Response({"message": "Activity not found.", "code": "NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
 
         return Response(
-            IssueActivitySerializer(issue_activity, fields=self.fields, expand=self.expand).data,
+            IssueActivitySerializer(
+                issue_activity,
+                fields=self.fields,
+                expand=self.expand,
+                context=_issue_chat_progress_context(request.user, slug, project_id),
+            ).data,
             status=status.HTTP_200_OK,
         )
 

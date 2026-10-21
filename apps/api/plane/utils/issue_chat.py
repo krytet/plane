@@ -16,6 +16,9 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import URLValidator
 from django.db import IntegrityError, transaction
+from django.db.models import CharField, Value
+from django.db.models.fields.json import KeyTextTransform
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from plane.db.models import Issue, IssueChatBinding, IssueLink, ProjectMember, WorkspaceMember
@@ -352,6 +355,25 @@ def _collect_chat_progress_json_nodes(value, nodes):
         _collect_chat_progress_json_nodes(item, nodes)
 
 
+def reject_managed_chat_progress(description_html=None, description_json=None):
+    """Fail closed when a create payload tries to forge a generated progress block."""
+
+    if description_html and _generated_block_bounds(description_html):
+        raise IssueChatProgressConflict(
+            "unexpected_block",
+            "Generated chat progress can only be created through chat binding sync.",
+        )
+
+    if description_json is not None:
+        nodes = {}
+        _collect_chat_progress_json_nodes(description_json, nodes)
+        if nodes:
+            raise IssueChatProgressConflict(
+                "unexpected_block",
+                "Generated chat progress can only be created through chat binding sync.",
+            )
+
+
 def _latest_chat_progress_json_node(marker_id, binding, current_nodes):
     node = deepcopy(current_nodes.get(marker_id, {}))
     attrs = node.get("attrs")
@@ -566,6 +588,38 @@ def can_view_issue_chat_progress(user, workspace_slug, project_id):
     ).exists()
 
 
+def scope_issue_links_for_user(queryset, user, workspace_slug, project_id):
+    """Hide managed chat links from users who cannot see generated progress."""
+
+    if can_view_issue_chat_progress(user, workspace_slug, project_id):
+        return queryset
+    managed_link_ids = list(
+        IssueChatBinding.objects.filter(
+            workspace__slug=workspace_slug,
+            project_id=project_id,
+            link_id__isnull=False,
+        ).values_list("link_id", flat=True)
+    )
+    return (
+        queryset.annotate(
+            _chat_link_kind=Coalesce(
+                KeyTextTransform("kind", "metadata"),
+                Value(""),
+                output_field=CharField(),
+            )
+        )
+        .exclude(_chat_link_kind="chat")
+        .exclude(metadata__has_key="chat_binding_id")
+        .exclude(pk__in=managed_link_ids)
+    )
+
+
+def is_issue_chat_link(link):
+    metadata = getattr(link, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return metadata.get("kind") == "chat" or bool(metadata.get("chat_binding_id"))
+
+
 def redact_chat_progress_html(description_html):
     """Remove generated progress blocks while preserving manual HTML."""
 
@@ -701,6 +755,38 @@ def get_issue_chat_progress_redacted_project_ids(user, workspace_slug, project_i
         if not (
             roles.get(project_id, -1) >= ROLE.MEMBER.value
             or (is_workspace_admin and project_id in roles)
+        )
+    }
+
+
+def get_issue_chat_progress_redacted_activity_project_ids(user, activities):
+    """Return redacted project IDs for activities from one or more workspaces."""
+
+    scopes = {}
+    for activity in activities:
+        project_id = getattr(activity, "project_id", None)
+        workspace = getattr(activity, "workspace", None)
+        workspace_slug = getattr(workspace, "slug", None)
+        if project_id is not None and workspace_slug:
+            scopes.setdefault(workspace_slug, set()).add(str(project_id))
+
+    redacted_project_ids = set()
+    for workspace_slug, project_ids in scopes.items():
+        redacted_project_ids.update(
+            get_issue_chat_progress_redacted_project_ids(
+                user,
+                workspace_slug,
+                project_ids,
+            )
+        )
+    return redacted_project_ids
+
+
+def issue_activity_chat_progress_context(user, activities):
+    return {
+        "redact_chat_progress_project_ids": get_issue_chat_progress_redacted_activity_project_ids(
+            user,
+            activities,
         )
     }
 

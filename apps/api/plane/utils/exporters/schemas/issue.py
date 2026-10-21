@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from django.db.models import F, QuerySet
 
 from plane.db.models import CycleIssue, FileAsset
-from plane.utils.issue_chat import redacted_issue_description_stripped
+from plane.utils.issue_chat import is_issue_chat_link, redacted_issue_description_stripped
 
 from .base import (
     DateField,
@@ -154,7 +154,15 @@ class IssueExportSchema(ExportSchema):
         return i.estimate_point.value if i.estimate_point and i.estimate_point.value else ""
 
     def prepare_link(self, i):
-        return [link.url for link in i.issue_link.all()]
+        redact_chat_progress = str(i.project_id) in self.context.get(
+            "redact_chat_progress_project_ids",
+            set(),
+        )
+        return [
+            link.url
+            for link in i.issue_link.all()
+            if not (redact_chat_progress and is_issue_chat_link(link))
+        ]
 
     def prepare_assignees(self, i):
         return [f"{u.first_name} {u.last_name}" for u in i.assignees.all()]

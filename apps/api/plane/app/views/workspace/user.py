@@ -39,6 +39,7 @@ from plane.app.serializers import (
     WorkspaceUserPropertiesSerializer,
 )
 from plane.app.views.base import BaseAPIView
+from plane.utils.issue_chat import issue_activity_chat_progress_context
 from plane.db.models import (
     CycleIssue,
     Issue,
@@ -431,7 +432,11 @@ class WorkspaceUserActivityEndpoint(BaseAPIView):
             ),
             request=request,
             queryset=queryset,
-            on_results=lambda issue_activities: IssueActivitySerializer(issue_activities, many=True).data,
+            on_results=lambda issue_activities: IssueActivitySerializer(
+                issue_activities,
+                many=True,
+                context=issue_activity_chat_progress_context(request.user, issue_activities),
+            ).data,
         )
 
 

@@ -8,6 +8,7 @@ import json
 # Django imports
 from django.core.serializers.json import DjangoJSONEncoder
 from django.utils import timezone
+from django.db import transaction
 from django.db.models import Q, Value, UUIDField
 from django.db.models.functions import Coalesce
 from django.contrib.postgres.aggregates import ArrayAgg
@@ -31,6 +32,7 @@ from plane.db.models import Intake, IntakeIssue, Issue, Project, ProjectMember, 
 from plane.utils.host import base_host
 from plane.utils.serializers import writable_data
 from plane.utils.content_validator import validate_html_content
+from plane.utils.issue_chat import IssueChatConflict, merge_latest_chat_description, reject_managed_chat_progress
 from .base import BaseAPIView
 from plane.db.models.intake import SourceType
 from plane.utils.openapi import (
@@ -193,6 +195,13 @@ class IntakeIssueListCreateAPIEndpoint(BaseAPIView):
         raw_description_html = issue_data.get("description_html", "<p></p>")
         _, _, sanitized_description_html = validate_html_content(raw_description_html)
         safe_description_html = sanitized_description_html if sanitized_description_html is not None else "<p></p>"
+        try:
+            reject_managed_chat_progress(safe_description_html, description_json)
+        except IssueChatConflict as exc:
+            return Response(
+                {"error": exc.message, "code": exc.code},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         issue = Issue.objects.create(
             name=issue_data.get("name"),
             description_json=description_json,
@@ -406,10 +415,51 @@ class IntakeIssueDetailAPIEndpoint(BaseAPIView):
         if issue_serializer:
             current_instance = issue
             # Log all the updates; read-only fields are ignored on save, so they are not reported either.
-            requested_data = json.dumps(writable_data(issue_serializer, issue_data), cls=DjangoJSONEncoder)
+            requested_data = writable_data(issue_serializer, issue_data)
+            try:
+                with transaction.atomic():
+                    issue = (
+                        Issue.objects.select_for_update(of=("self",))
+                        .filter(workspace__slug=slug, project_id=project_id, pk=issue_id)
+                        .first()
+                    )
+                    if issue is None:
+                        return Response(
+                            {"error": "Work item not found"},
+                            status=status.HTTP_404_NOT_FOUND,
+                        )
+                    if any(
+                        field in issue_serializer.validated_data
+                        for field in ("description_html", "description_json")
+                    ):
+                        merged_description, merged_description_json = merge_latest_chat_description(
+                            issue,
+                            issue_serializer.validated_data.get(
+                                "description_html",
+                                issue.description_html,
+                            ),
+                            (
+                                issue_serializer.validated_data.get("description_json")
+                                if "description_json" in issue_serializer.validated_data
+                                else None
+                            ),
+                        )
+                        issue_serializer.instance = issue
+                        issue_serializer.validated_data["description_html"] = merged_description
+                        requested_data["description_html"] = merged_description
+                        if merged_description_json is not None:
+                            issue_serializer.validated_data["description_json"] = merged_description_json
+                            requested_data["description_json"] = merged_description_json
+                    issue_serializer.save()
+            except IssueChatConflict as exc:
+                return Response(
+                    {"error": exc.message, "code": exc.code},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
             issue_activity.delay(
                 type="issue.activity.updated",
-                requested_data=requested_data,
+                requested_data=json.dumps(requested_data, cls=DjangoJSONEncoder),
                 actor_id=str(request.user.id),
                 issue_id=str(issue_id),
                 project_id=str(project_id),
@@ -420,7 +470,6 @@ class IntakeIssueDetailAPIEndpoint(BaseAPIView):
                 epoch=int(timezone.now().timestamp()),
                 intake=str(intake_issue.id),
             )
-            issue_serializer.save()
 
         # Save intake issue (state transition happens in serializer's update method)
         if intake_serializer:

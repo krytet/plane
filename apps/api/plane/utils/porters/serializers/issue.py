@@ -7,7 +7,11 @@ from rest_framework import serializers
 
 # Module imports
 from plane.app.serializers import IssueSerializer
-from plane.utils.issue_chat import redacted_issue_description_stripped, redact_issue_description_fields
+from plane.utils.issue_chat import (
+    is_issue_chat_link,
+    redacted_issue_description_stripped,
+    redact_issue_description_fields,
+)
 
 
 class IssueExportSerializer(IssueSerializer):
@@ -115,12 +119,17 @@ class IssueExportSerializer(IssueSerializer):
 
     def get_links(self, obj):
         """Return list of issue links with titles."""
+        redact_chat_progress = str(obj.project_id) in self.context.get(
+            "redact_chat_progress_project_ids",
+            set(),
+        )
         return [
             {
                 "url": link.url,
                 "title": link.title if link.title else link.url,
             }
             for link in obj.issue_link.all()
+            if not (redact_chat_progress and is_issue_chat_link(link))
         ]
 
     def get_relations(self, obj):

@@ -32,6 +32,7 @@ from plane.utils.issue_chat import (
     redact_issue_description_fields,
     redact_chat_progress_html,
     redact_chat_progress_json,
+    reject_managed_chat_progress,
 )
 from plane.bgtasks.issue_activities_task import issue_activity
 from plane.db.models.intake import SourceType
@@ -159,16 +160,25 @@ class IntakeIssuePublicViewSet(BaseViewSet):
             )
 
         # Sanitize description_html before saving to prevent stored XSS
-        raw_description_html = request.data.get("issue", {}).get("description_html", "<p></p>")
+        issue_data = request.data.get("issue", {})
+        raw_description_html = issue_data.get("description_html", "<p></p>")
         _, _, sanitized_description_html = validate_html_content(raw_description_html)
         safe_description_html = sanitized_description_html if sanitized_description_html is not None else "<p></p>"
+        description_json = issue_data.get("description") or issue_data.get("description_json") or {}
+        try:
+            reject_managed_chat_progress(safe_description_html, description_json)
+        except IssueChatConflict as exc:
+            return Response(
+                {"error": exc.message, "code": exc.code},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # create an issue
         issue = Issue.objects.create(
-            name=request.data.get("issue", {}).get("name"),
-            description_json=request.data.get("issue", {}).get("description_json", {}),
+            name=issue_data.get("name"),
+            description_json=description_json,
             description_html=safe_description_html,
-            priority=request.data.get("issue", {}).get("priority", "low"),
+            priority=issue_data.get("priority", "low"),
             project_id=project_deploy_board.project_id,
             state_id=triage_state.id,
         )

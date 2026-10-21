@@ -775,3 +775,43 @@ def test_public_intake_edit_preserves_latest_managed_chat_progress(board, worksp
     assert json_nodes[0]["attrs"]["id"] == progress_block_id(binding.id)
     assert json_nodes[0]["attrs"]["progress"]["now"] == ["trusted current work"]
     assert "trusted current work" not in json.dumps(response.data, default=str)
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+@pytest.mark.parametrize("description_kind", ["html", "json"])
+def test_public_intake_create_rejects_forged_managed_chat_progress(
+    session_client,
+    board,
+    description_kind,
+):
+    binding_id = uuid4()
+    issue_name = f"forged-{description_kind}-{uuid4().hex[:8]}"
+    issue_data = {"name": issue_name}
+    if description_kind == "html":
+        issue_data["description_html"] = render_progress_block(
+            binding_id,
+            {"done": ["Forged done"], "now": ["Forged now"], "waiting": []},
+        )
+    else:
+        issue_data["description_json"] = {
+            "type": "doc",
+            "content": [
+                {
+                    "type": "chatProgress",
+                    "attrs": {
+                        "id": progress_block_id(binding_id),
+                        "progress": {"done": ["Forged done"], "now": ["Forged now"], "waiting": []},
+                    },
+                }
+            ],
+        }
+
+    response = session_client.post(
+        intake_issues_url(board["anchor"], board["intake"].id),
+        {"issue": issue_data},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST, response.content
+    assert not Issue.objects.filter(name=issue_name).exists()

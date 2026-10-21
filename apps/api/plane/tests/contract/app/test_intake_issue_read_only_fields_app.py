@@ -118,3 +118,61 @@ def test_intake_update_preserves_generated_html_and_json_nodes(session_client, w
     assert len(json_nodes) == 1
     assert json_nodes[0]["attrs"]["id"] == progress_block_id(binding.id)
     assert json_nodes[0]["attrs"]["progress"]["now"] == ["Trusted now"]
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_json_only_intake_update_preserves_latest_managed_progress(session_client, workspace, intake_issue):
+    binding = IssueChatBinding.objects.create(
+        workspace=workspace,
+        project=intake_issue.project,
+        issue=intake_issue,
+        provider="codex",
+        thread_id="intake-json-only",
+        progress={"done": ["Trusted JSON done"], "now": ["Trusted JSON now"], "waiting": []},
+    )
+    block = render_progress_block(binding.id, binding.progress)
+    intake_issue.description_html = f"<p>Original intake text.</p>{block}"
+    intake_issue.description_json = {
+        "type": "doc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Original intake text."}]},
+            {
+                "type": "chatProgress",
+                "attrs": {"id": progress_block_id(binding.id), "progress": binding.progress},
+            },
+        ],
+    }
+    intake_issue.save(update_fields=["description_html", "description_json"])
+    IssueChatBinding.objects.filter(pk=binding.pk).update(generated_block_hash=progress_block_hash(block))
+
+    stale_json = {
+        "type": "doc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Edited JSON only."}]},
+            {
+                "type": "chatProgress",
+                "attrs": {
+                    "id": progress_block_id(binding.id),
+                    "progress": {"done": [], "now": ["Forged JSON now"], "waiting": []},
+                },
+            },
+        ],
+    }
+    response = session_client.patch(
+        f"/api/workspaces/{workspace.slug}/projects/{intake_issue.project_id}/intake-issues/{intake_issue.id}/",
+        {"issue": {"description_json": stale_json}},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK, response.data
+    intake_issue.refresh_from_db()
+    assert "Trusted JSON now" in intake_issue.description_html
+    json_nodes = [
+        node
+        for node in intake_issue.description_json.get("content", [])
+        if node.get("type") == "chatProgress"
+    ]
+    assert len(json_nodes) == 1
+    assert json_nodes[0]["attrs"]["progress"]["now"] == ["Trusted JSON now"]
+    assert "Forged JSON now" not in str(intake_issue.description_json)

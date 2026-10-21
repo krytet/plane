@@ -12,7 +12,7 @@ from uuid import uuid4
 import pytest
 
 from plane.bgtasks.export_task import issue_export_task
-from plane.db.models import ExporterHistory, Issue, Project, ProjectMember, User, WorkspaceMember
+from plane.db.models import ExporterHistory, Issue, IssueLink, Project, ProjectMember, User, WorkspaceMember
 from plane.utils.issue_chat import progress_block_id, render_progress_block
 from plane.utils.exporters.schemas.issue import IssueExportSchema
 
@@ -105,6 +105,22 @@ def test_export_redacts_generated_description_for_project_guests(
     )
     issue.description_html = f"<p>Manual export description.</p>{block}"
     issue.save()
+    IssueLink.objects.create(
+        workspace=workspace,
+        project=project,
+        issue=issue,
+        url="https://chatgpt.com/codex/tasks/export-private",
+        title="Managed chat",
+        metadata={"kind": "chat", "chat_binding_id": str(binding_id)},
+    )
+    IssueLink.objects.create(
+        workspace=workspace,
+        project=project,
+        issue=issue,
+        url="https://example.com/export-regular",
+        title="Regular export link",
+        metadata={"source": "manual"},
+    )
 
     rows = _exported_rows(workspace, project, user)
 
@@ -112,6 +128,9 @@ def test_export_redacts_generated_description_for_project_guests(
     assert "Manual export description." in rows[0]["description"]
     assert ('id="' + progress_block_id(binding_id) + '"') not in rows[0]["description"]
     assert ("Managed completion" in rows[0]["description"]) is expected_managed_text
+    exported_link_urls = {link["url"] for link in rows[0]["links"]}
+    assert "https://example.com/export-regular" in exported_link_urls
+    assert ("https://chatgpt.com/codex/tasks/export-private" in exported_link_urls) is expected_managed_text
 
 
 @pytest.mark.django_db
@@ -123,6 +142,20 @@ def test_issue_export_schema_redacts_only_restricted_projects(workspace, project
     )
     issue.description_html = f"<p>Manual schema description.</p>{block}"
     issue.save()
+    IssueLink.objects.create(
+        workspace=workspace,
+        project=project,
+        issue=issue,
+        url="https://chatgpt.com/codex/tasks/schema-private",
+        metadata={"kind": "chat", "chat_binding_id": str(uuid4())},
+    )
+    IssueLink.objects.create(
+        workspace=workspace,
+        project=project,
+        issue=issue,
+        url="https://example.com/schema-regular",
+        metadata={"source": "manual"},
+    )
 
     restricted = IssueExportSchema(
         context={"redact_chat_progress_project_ids": {str(project.id)}}
@@ -130,4 +163,9 @@ def test_issue_export_schema_redacts_only_restricted_projects(workspace, project
     privileged = IssueExportSchema(context={"redact_chat_progress_project_ids": set()}).serialize(issue)
 
     assert restricted["description"] == "Manual schema description."
+    assert restricted["link"] == ["https://example.com/schema-regular"]
+    assert set(privileged["link"]) == {
+        "https://chatgpt.com/codex/tasks/schema-private",
+        "https://example.com/schema-regular",
+    }
     assert "Schema completion" in privileged["description"]

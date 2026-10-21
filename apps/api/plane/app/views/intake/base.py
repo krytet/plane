@@ -352,7 +352,10 @@ class IntakeIssueViewSet(BaseViewSet):
     @allow_permission(allowed_roles=[ROLE.ADMIN], creator=True, model=Issue)
     def partial_update(self, request, slug, project_id, pk):
         skip_activity = request.data.pop("skip_activity", False)
-        is_description_update = request.data.get("description_html") is not None
+        issue_request = request.data.get("issue") or {}
+        is_description_update = any(
+            field in issue_request for field in ("description_html", "description_json")
+        )
 
         intake_id = Intake.objects.filter(workspace__slug=slug, project_id=project_id).first()
         intake_issue = IntakeIssue.objects.get(
@@ -464,11 +467,21 @@ class IntakeIssueViewSet(BaseViewSet):
                     if issue is None:
                         return Response({"error": "Work item not found"}, status=status.HTTP_404_NOT_FOUND)
                     issue_current_instance = json.dumps(IssueDetailSerializer(issue).data, cls=DjangoJSONEncoder)
-                    if "description_html" in issue_serializer.validated_data:
+                    if any(
+                        field in issue_serializer.validated_data
+                        for field in ("description_html", "description_json")
+                    ):
                         merged_description, merged_description_json = merge_latest_chat_description(
                             issue,
-                            issue_serializer.validated_data["description_html"],
-                            issue_serializer.validated_data.get("description_json"),
+                            issue_serializer.validated_data.get(
+                                "description_html",
+                                issue.description_html,
+                            ),
+                            (
+                                issue_serializer.validated_data.get("description_json")
+                                if "description_json" in issue_serializer.validated_data
+                                else None
+                            ),
                         )
                         issue_serializer.instance = issue
                         issue_serializer.validated_data["description_html"] = merged_description
