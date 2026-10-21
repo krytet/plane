@@ -76,6 +76,10 @@ dependencies = [
     "drf-spectacular==0.29.0",
     # html sanitizer
     "nh3==0.2.18",
+    # llm complete report generation
+    "font-roboto==0.0.1",
+    "pillow==13.0.0",
+    "reportlab==5.0.1",
 ]
 
 [dependency-groups]

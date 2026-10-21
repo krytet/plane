@@ -945,8 +945,24 @@ class WorkspaceAssetDownloadEndpoint(BaseAPIView):
                 id=asset_id,
                 workspace__slug=slug,
                 is_uploaded=True,
+                is_deleted=False,
+                deleted_at__isnull=True,
             )
         except FileAsset.DoesNotExist:
+            return Response(
+                {"error": "The requested asset could not be found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if (
+            asset.project_id
+            and not ProjectMember.objects.filter(
+                member=request.user,
+                workspace_id=asset.workspace_id,
+                project_id=asset.project_id,
+                is_active=True,
+            ).exists()
+        ):
             return Response(
                 {"error": "The requested asset could not be found."},
                 status=status.HTTP_404_NOT_FOUND,
@@ -973,6 +989,8 @@ class ProjectAssetDownloadEndpoint(BaseAPIView):
                 workspace__slug=slug,
                 project_id=project_id,
                 is_uploaded=True,
+                is_deleted=False,
+                deleted_at__isnull=True,
             )
         except FileAsset.DoesNotExist:
             return Response(
