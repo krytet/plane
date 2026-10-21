@@ -13,6 +13,7 @@ from rest_framework import serializers
 # Module imports
 from plane.db.models import (
     Issue,
+    IssueChatBinding,
     IssueType,
     IssueActivity,
     IssueAssignee,
@@ -31,6 +32,7 @@ from plane.utils.content_validator import (
     validate_html_content,
     validate_binary_data,
 )
+from plane.utils.issue_chat import IssueChatInputError, normalize_chat_binding_url
 
 from .base import BaseSerializer
 from .cycle import CycleLiteSerializer, CycleSerializer
@@ -140,9 +142,9 @@ class IssueSerializer(BaseSerializer):
         # Validate labels are from project
         if data.get("labels", []):
             valid_label_ids = set(
-                Label.objects.filter(
-                    project_id=self.context.get("project_id"), id__in=data["labels"]
-                ).values_list("id", flat=True)
+                Label.objects.filter(project_id=self.context.get("project_id"), id__in=data["labels"]).values_list(
+                    "id", flat=True
+                )
             )
             invalid_label_ids = set(data["labels"]) - valid_label_ids
             if invalid_label_ids:
@@ -509,6 +511,76 @@ class IssueLinkSerializer(BaseSerializer):
             "created_at",
             "updated_at",
         ]
+
+
+class IssueChatProgressSerializer(serializers.Serializer):
+    done = serializers.ListField(
+        child=serializers.CharField(max_length=1000, trim_whitespace=True),
+        max_length=50,
+        required=False,
+        default=list,
+    )
+    now = serializers.ListField(
+        child=serializers.CharField(max_length=1000, trim_whitespace=True),
+        max_length=50,
+        required=False,
+        default=list,
+    )
+    waiting = serializers.ListField(
+        child=serializers.CharField(max_length=1000, trim_whitespace=True),
+        max_length=50,
+        required=False,
+        default=list,
+    )
+
+    def validate(self, attrs):
+        return {key: [item for item in attrs.get(key, []) if item.strip()] for key in ("done", "now", "waiting")}
+
+
+class IssueChatBindingSyncSerializer(serializers.Serializer):
+    provider = serializers.ChoiceField(choices=IssueChatBinding.Provider.choices)
+    thread_id = serializers.CharField(max_length=255, trim_whitespace=True)
+    url = serializers.CharField(max_length=2048, required=False, allow_blank=False)
+    title = serializers.CharField(max_length=255, trim_whitespace=True, required=False, allow_blank=True)
+    cursor = serializers.IntegerField(min_value=1)
+    progress = IssueChatProgressSerializer()
+
+    def validate_thread_id(self, value):
+        if not value:
+            raise serializers.ValidationError("Thread ID cannot be blank.")
+        return value
+
+    def validate(self, attrs):
+        attrs["title"] = attrs.get("title") or None
+        try:
+            attrs["url"] = normalize_chat_binding_url(
+                attrs["provider"],
+                attrs["thread_id"],
+                attrs.get("url"),
+            )
+        except IssueChatInputError as exc:
+            raise serializers.ValidationError({exc.field: exc.message}) from exc
+        return attrs
+
+
+class IssueChatBindingSerializer(BaseSerializer):
+    link = IssueLinkSerializer(read_only=True)
+
+    class Meta:
+        model = IssueChatBinding
+        fields = [
+            "id",
+            "issue_id",
+            "link",
+            "provider",
+            "thread_id",
+            "sync_cursor",
+            "progress",
+            "last_synced_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
 
 
 class IssueRelationRefSerializer(serializers.Serializer):

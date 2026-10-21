@@ -20,6 +20,20 @@ export type TFileEntityInfo = {
 
 export type TFileMetaData = TFileMetaDataLite & TFileEntityInfo;
 
+export type TProjectFile = {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  url: string;
+  created_at: string;
+  project_id: string;
+  project_identifier: string;
+  issue_id: string | null;
+  issue_identifier: string | null;
+  issue_name: string | null;
+};
+
 export type TFileSignedURLResponse = {
   asset_id: string;
   asset_url: string;

@@ -53,7 +53,7 @@ from .cycle import (
     CycleWriteSerializer,
     CycleUserPropertiesSerializer,
 )
-from .asset import FileAssetSerializer
+from .asset import FileAssetSerializer, ProjectFileOverviewSerializer
 from .issue import (
     IssueCreateSerializer,
     IssueActivitySerializer,
@@ -82,6 +82,11 @@ from .issue import (
     IssueVersionDetailSerializer,
     IssueDescriptionVersionDetailSerializer,
     IssueListDetailSerializer,
+)
+from .issue_chat import (
+    IssueChatBindingSerializer,
+    IssueChatBindingSyncSerializer,
+    IssueChatProgressSerializer,
 )
 
 from .module import (

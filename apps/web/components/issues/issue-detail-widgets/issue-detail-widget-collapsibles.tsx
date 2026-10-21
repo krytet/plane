@@ -13,6 +13,7 @@ import { useIssueDetail } from "@/hooks/store/use-issue-detail";
 import { useTimeLineRelationOptions } from "@/components/relations";
 // local imports
 import { AttachmentsCollapsible } from "./attachments";
+import { ChatsCollapsible } from "./chats";
 import { LinksCollapsible } from "./links";
 import { RelationsCollapsible } from "./relations";
 import { SubIssuesCollapsible } from "./sub-issues";
@@ -80,6 +81,15 @@ export const IssueDetailWidgetCollapsibles = observer(function IssueDetailWidget
       )}
       {shouldRenderAttachments && (
         <AttachmentsCollapsible
+          workspaceSlug={workspaceSlug}
+          projectId={projectId}
+          issueId={issueId}
+          disabled={disabled}
+          issueServiceType={issueServiceType}
+        />
+      )}
+      {!hideWidgets?.includes("chats") && (
+        <ChatsCollapsible
           workspaceSlug={workspaceSlug}
           projectId={projectId}
           issueId={issueId}

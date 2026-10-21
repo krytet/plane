@@ -21,7 +21,8 @@ from rest_framework.permissions import AllowAny
 from ..base import BaseAPIView
 from plane.db.models import FileAsset, Workspace, Project, User, WorkspaceMember, ProjectMember
 from plane.settings.storage import S3Storage
-from plane.app.permissions import allow_permission, ROLE
+from plane.app.serializers import ProjectFileOverviewSerializer
+from plane.app.permissions import ProjectEntityPermission, allow_permission, ROLE
 from plane.utils.cache import invalidate_cache_directly
 from plane.utils.path_validator import sanitize_filename
 from plane.bgtasks.storage_metadata_task import get_asset_object_metadata
@@ -987,3 +988,35 @@ class ProjectAssetDownloadEndpoint(BaseAPIView):
         )
 
         return HttpResponseRedirect(signed_url)
+
+
+class ProjectFileOverviewEndpoint(BaseAPIView):
+    """List uploaded, active issue attachments for one project."""
+
+    permission_classes = [ProjectEntityPermission]
+
+    @allow_permission([ROLE.ADMIN, ROLE.MEMBER])
+    def get(self, request, slug, project_id):
+        assets = (
+            FileAsset.objects.filter(
+                workspace__slug=slug,
+                project_id=project_id,
+                issue_id__isnull=False,
+                issue__project_id=project_id,
+                issue__deleted_at__isnull=True,
+                entity_type=FileAsset.EntityTypeContext.ISSUE_ATTACHMENT,
+                is_uploaded=True,
+                is_deleted=False,
+                deleted_at__isnull=True,
+            )
+            .select_related("project", "issue")
+            .order_by("-created_at")
+        )
+        return self.paginate(
+            request=request,
+            queryset=assets,
+            order_by="-created_at",
+            default_per_page=100,
+            max_per_page=1000,
+            on_results=lambda results: ProjectFileOverviewSerializer(results, many=True).data,
+        )

@@ -384,6 +384,44 @@ class IssueLink(ProjectBaseModel):
         return f"{self.issue.name} {self.url}"
 
 
+class IssueChatBinding(ProjectBaseModel):
+    class Provider(models.TextChoices):
+        CODEX = "codex", "Codex"
+        CHATGPT = "chatgpt", "ChatGPT"
+
+    issue = models.ForeignKey("db.Issue", on_delete=models.CASCADE, related_name="chat_bindings")
+    link = models.OneToOneField(
+        "db.IssueLink",
+        on_delete=models.SET_NULL,
+        related_name="chat_binding",
+        null=True,
+        blank=True,
+    )
+    provider = models.CharField(max_length=20, choices=Provider.choices)
+    thread_id = models.CharField(max_length=255)
+    sync_cursor = models.PositiveBigIntegerField(default=0)
+    progress = models.JSONField(default=dict)
+    payload_hash = models.CharField(max_length=64, blank=True, default="")
+    generated_block_hash = models.CharField(max_length=64, blank=True, default="")
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Issue Chat Binding"
+        verbose_name_plural = "Issue Chat Bindings"
+        db_table = "issue_chat_bindings"
+        ordering = ("-created_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["workspace", "provider", "thread_id"],
+                condition=Q(deleted_at__isnull=True),
+                name="issue_chat_binding_unique_workspace_provider_thread",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.provider}:{self.thread_id} <{self.issue.name}>"
+
+
 def get_upload_path(instance, filename):
     filename = sanitize_filename(filename) or uuid4().hex
     return f"{instance.workspace.id}/{uuid4().hex}-{filename}"

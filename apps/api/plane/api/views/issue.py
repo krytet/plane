@@ -10,7 +10,7 @@ import re
 # Django imports
 from django.core.serializers.json import DjangoJSONEncoder
 from django.http import HttpResponseRedirect
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.db.models import (
     Case,
     CharField,
@@ -46,6 +46,8 @@ from plane.api.serializers import (
     IssueAttachmentSerializer,
     IssueActivitySerializer,
     IssueCommentSerializer,
+    IssueChatBindingSerializer,
+    IssueChatBindingSyncSerializer,
     IssueLinkSerializer,
     IssueRelationCreateSerializer,
     IssueRelationResponseSerializer,
@@ -92,8 +94,16 @@ from .base import BaseAPIView
 from plane.utils.host import base_host
 from plane.utils.serializers import writable_data
 from plane.utils.issue_relation_mapper import get_actual_relation
+from plane.utils.issue_chat import (
+    IssueChatConflict,
+    IssueChatInputError,
+    IssueChatNotFound,
+    list_issue_chat_bindings,
+    merge_latest_chat_blocks,
+    sync_issue_chat_binding,
+)
 from plane.bgtasks.webhook_task import model_activity
-from plane.app.permissions import ROLE
+from plane.app.permissions import ROLE, allow_permission
 from plane.utils.openapi import (
     work_item_docs,
     work_item_relation_docs,
@@ -659,11 +669,43 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                     partial=True,
                 )
                 if serializer.is_valid():
-                    # If the serializer is valid, save the issue and dispatch
-                    # the update issue activity worker event.
-                    serializer.save()
+                    merged_description = None
+                    try:
+                        if "description_html" in serializer.validated_data:
+                            with transaction.atomic():
+                                issue = (
+                                    Issue.objects.select_for_update(of=("self",))
+                                    .filter(workspace__slug=slug, project_id=project_id, pk=issue.id)
+                                    .first()
+                                )
+                                if issue is None:
+                                    return Response(
+                                        {"error": "Work item not found"},
+                                        status=status.HTTP_404_NOT_FOUND,
+                                    )
+                                current_instance = json.dumps(
+                                    IssueSerializer(issue).data,
+                                    cls=DjangoJSONEncoder,
+                                )
+                                merged_description = merge_latest_chat_blocks(
+                                    issue,
+                                    serializer.validated_data["description_html"],
+                                )
+                                serializer.instance = issue
+                                serializer.validated_data["description_html"] = merged_description
+                                serializer.save()
+                        else:
+                            serializer.save()
+                    except IssueChatConflict as exc:
+                        return Response(
+                            {"error": exc.message, "code": exc.code},
+                            status=status.HTTP_409_CONFLICT,
+                        )
+
                     # Read-only fields are ignored on save, so they are not reported as changes either.
                     accepted_data = writable_data(serializer, request.data)
+                    if merged_description is not None:
+                        accepted_data["description_html"] = merged_description
                     issue_activity.delay(
                         type="issue.activity.updated",
                         requested_data=json.dumps(accepted_data, cls=DjangoJSONEncoder),
@@ -809,9 +851,40 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                     status=status.HTTP_409_CONFLICT,
                 )
 
-            serializer.save()
+            merged_description = None
+            try:
+                if "description_html" in serializer.validated_data:
+                    with transaction.atomic():
+                        issue = (
+                            Issue.objects.select_for_update(of=("self",))
+                            .filter(workspace__slug=slug, project_id=project_id, pk=pk)
+                            .first()
+                        )
+                        if issue is None:
+                            return Response(
+                                {"error": "Work item not found"},
+                                status=status.HTTP_404_NOT_FOUND,
+                            )
+                        current_instance = json.dumps(IssueSerializer(issue).data, cls=DjangoJSONEncoder)
+                        merged_description = merge_latest_chat_blocks(
+                            issue,
+                            serializer.validated_data["description_html"],
+                        )
+                        serializer.instance = issue
+                        serializer.validated_data["description_html"] = merged_description
+                        serializer.save()
+                else:
+                    serializer.save()
+            except IssueChatConflict as exc:
+                return Response(
+                    {"error": exc.message, "code": exc.code},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
             # Read-only fields are ignored on save, so they are not reported as changes either.
             accepted_data = writable_data(serializer, request.data)
+            if merged_description is not None:
+                accepted_data["description_html"] = merged_description
             issue_activity.delay(
                 type="issue.activity.updated",
                 requested_data=json.dumps(accepted_data, cls=DjangoJSONEncoder),
@@ -1373,6 +1446,62 @@ class IssueLinkDetailAPIEndpoint(BaseAPIView):
         )
         issue_link.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class IssueChatBindingAPIEndpoint(BaseAPIView):
+    """List and idempotently sync Codex/ChatGPT progress for one work item."""
+
+    permission_classes = [ProjectEntityPermission]
+    serializer_class = IssueChatBindingSerializer
+
+    @staticmethod
+    def _conflict(exc):
+        return Response(
+            {"error": exc.message, "code": exc.code},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    @allow_permission([ROLE.ADMIN, ROLE.MEMBER])
+    def get(self, request, slug, project_id, issue_id):
+        try:
+            bindings = list_issue_chat_bindings(slug, project_id, issue_id)
+        except IssueChatNotFound:
+            return Response(
+                {"error": "The requested resource does not exist."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(self.serializer_class(bindings, many=True).data, status=status.HTTP_200_OK)
+
+    @allow_permission([ROLE.ADMIN, ROLE.MEMBER])
+    def post(self, request, slug, project_id, issue_id):
+        serializer = IssueChatBindingSyncSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            result = sync_issue_chat_binding(
+                workspace_slug=slug,
+                project_id=project_id,
+                issue_id=issue_id,
+                actor=request.user,
+                **serializer.validated_data,
+            )
+        except IssueChatNotFound:
+            return Response(
+                {"error": "The requested resource does not exist."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except IssueChatInputError as exc:
+            return Response({exc.field: [exc.message]}, status=status.HTTP_400_BAD_REQUEST)
+        except IssueChatConflict as exc:
+            return self._conflict(exc)
+
+        response_data = self.serializer_class(result.binding).data
+        response_data["applied"] = result.applied
+        return Response(
+            response_data,
+            status=status.HTTP_201_CREATED if result.created else status.HTTP_200_OK,
+        )
 
 
 class IssueCommentListCreateAPIEndpoint(BaseAPIView):

@@ -9,6 +9,7 @@ export enum CORE_EXTENSIONS {
   BOLD = "bold",
   BULLET_LIST = "bulletList",
   CALLOUT = "calloutComponent",
+  CHAT_PROGRESS = "chatProgress",
   CHARACTER_COUNT = "characterCount",
   CODE_BLOCK = "codeBlock",
   CODE_INLINE = "code",

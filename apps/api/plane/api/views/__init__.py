@@ -23,6 +23,7 @@ from .issue import (
     LabelDetailAPIEndpoint,
     IssueLinkListCreateAPIEndpoint,
     IssueLinkDetailAPIEndpoint,
+    IssueChatBindingAPIEndpoint,
     IssueCommentListCreateAPIEndpoint,
     IssueCommentDetailAPIEndpoint,
     IssueActivityListAPIEndpoint,

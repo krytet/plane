@@ -9,6 +9,7 @@ import { useMemo, useCallback } from "react";
 import { EUserPermissions, EUserPermissionsLevel } from "@plane/constants";
 import {
   CyclesOutline,
+  FolderOutline,
   IntakeOutline,
   ModuleOutline,
   PagesOutline,
@@ -89,6 +90,16 @@ export const useNavigationItems = ({
         access: [EUserPermissions.ADMIN, EUserPermissions.MEMBER, EUserPermissions.GUEST],
         shouldRender: !!project?.page_view,
         sortOrder: 5,
+      },
+      {
+        i18n_key: "sidebar.files",
+        key: "files",
+        name: "Files",
+        href: `/${workspaceSlug}/projects/${projectId}/files`,
+        icon: FolderOutline,
+        access: [EUserPermissions.ADMIN, EUserPermissions.MEMBER],
+        shouldRender: true,
+        sortOrder: 7,
       },
       {
         i18n_key: "sidebar.intake",

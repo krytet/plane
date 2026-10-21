@@ -5,6 +5,7 @@
  */
 
 export * from "./callout";
+export * from "./chat-progress";
 export * from "./code";
 export * from "./code-inline";
 export * from "./custom-link";

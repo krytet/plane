@@ -114,6 +114,7 @@ from .asset.v2 import (
     DuplicateAssetEndpoint,
     WorkspaceAssetDownloadEndpoint,
     ProjectAssetDownloadEndpoint,
+    ProjectFileOverviewEndpoint,
 )
 from .issue.base import (
     IssueListEndpoint,
@@ -139,6 +140,7 @@ from .issue.attachment import (
 )
 
 from .issue.comment import IssueCommentViewSet, CommentReactionViewSet
+from .issue.chat import IssueChatBindingEndpoint
 
 from .issue.label import LabelViewSet, BulkCreateIssueLabelsEndpoint
 

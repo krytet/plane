@@ -7,14 +7,15 @@
 import type { HocuspocusProvider } from "@hocuspocus/provider";
 import type { Extensions } from "@tiptap/core";
 import { CharacterCount } from "@tiptap/extension-character-count";
-import TaskItem from "@tiptap/extension-task-item";
-import TaskList from "@tiptap/extension-task-list";
+import DefaultTaskItem from "@tiptap/extension-task-item";
+import DefaultTaskList from "@tiptap/extension-task-list";
 import { TextStyle } from "@tiptap/extension-text-style";
 import { Underline } from "@tiptap/extension-underline";
 import { Markdown } from "tiptap-markdown";
 // extensions
 import {
   CustomCalloutExtension,
+  ChatProgressExtensionConfig,
   CustomCodeBlockExtension,
   CustomCodeInlineExtension,
   CustomColorExtension,
@@ -92,12 +93,12 @@ export const CoreEditorExtensions = (args: TArguments): Extensions => {
     CustomTypographyExtension,
     Underline,
     TextStyle,
-    TaskList.configure({
+    DefaultTaskList.configure({
       HTMLAttributes: {
         class: "not-prose pl-2 space-y-2",
       },
     }),
-    TaskItem.configure({
+    DefaultTaskItem.configure({
       HTMLAttributes: {
         class: "relative",
       },
@@ -121,6 +122,7 @@ export const CoreEditorExtensions = (args: TArguments): Extensions => {
     CustomColorExtension,
     CustomTextAlignExtension,
     CustomCalloutExtension,
+    ChatProgressExtensionConfig,
     UtilityExtension({
       disabledExtensions,
       flaggedExtensions,

@@ -10,6 +10,7 @@ import json
 from django.contrib.postgres.aggregates import ArrayAgg
 from django.contrib.postgres.fields import ArrayField
 from django.core.serializers.json import DjangoJSONEncoder
+from django.db import transaction
 from django.db.models import (
     Count,
     Exists,
@@ -71,6 +72,7 @@ from plane.utils.grouper import (
 from plane.utils.host import base_host
 from plane.utils.serializers import writable_data
 from plane.utils.issue_filters import issue_filters
+from plane.utils.issue_chat import IssueChatConflict, merge_latest_chat_blocks
 from plane.utils.order_queryset import order_issue_queryset
 from plane.utils.paginator import GroupedOffsetPaginator, SubGroupedOffsetPaginator
 from plane.utils.timezone_converter import user_timezone_converter
@@ -679,9 +681,38 @@ class IssueViewSet(BaseViewSet):
 
         serializer = IssueCreateSerializer(issue, data=request.data, partial=True, context={"project_id": project_id})
         if serializer.is_valid():
-            serializer.save()
+            merged_description = None
+            try:
+                if is_description_update:
+                    with transaction.atomic():
+                        issue = (
+                            Issue.objects.select_for_update(of=("self",))
+                            .filter(workspace__slug=slug, project_id=project_id, pk=pk)
+                            .first()
+                        )
+                        if issue is None:
+                            return Response({"error": "Issue not found"}, status=status.HTTP_404_NOT_FOUND)
+
+                        current_instance = json.dumps(IssueDetailSerializer(issue).data, cls=DjangoJSONEncoder)
+                        merged_description = merge_latest_chat_blocks(
+                            issue,
+                            serializer.validated_data["description_html"],
+                        )
+                        serializer.instance = issue
+                        serializer.validated_data["description_html"] = merged_description
+                        serializer.save()
+                else:
+                    serializer.save()
+            except IssueChatConflict as exc:
+                return Response(
+                    {"error": exc.message, "code": exc.code},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
             # Read-only fields are ignored on save, so they are not reported as changes either.
             accepted_data = writable_data(serializer, request.data)
+            if merged_description is not None:
+                accepted_data["description_html"] = merged_description
             # Check if the update is a migration description update
             is_migration_description_update = skip_activity and is_description_update
             # Log all the updates
