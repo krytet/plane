@@ -2,7 +2,7 @@ import type { AdapterConfig, ThreadTarget } from "./config.ts";
 import { assertSupportedProviders, normalizeUuid } from "./config.ts";
 import { ChatSyncError, codeForError } from "./errors.ts";
 import type { CodexReader, CodexTurn } from "./app-server.ts";
-import type { PlaneBinding, PlaneClient } from "./plane-client.ts";
+import type { PlaneBinding, PlaneClient, PlaneObservation, PlaneObservationWriteResult } from "./plane-client.ts";
 import {
   getBindingState,
   nextCursor,
@@ -97,6 +97,124 @@ function logSkipped(log: EventLogger, target: ThreadTarget, event: string, code?
   return { synced: 0, skipped: 1, errors: code ? 1 : 0 };
 }
 
+function observationForTurn(turn: CodexTurn): PlaneObservation | null {
+  if (turn.status === "completed" && turn.completedAt !== null) {
+    return {
+      state: "answer_available",
+      observed_at: new Date(turn.completedAt * 1_000).toISOString(),
+      turn_id: turn.id,
+    };
+  }
+  return null;
+}
+
+function bindingMatchesObservation(binding: PlaneBinding, observation: PlaneObservation): boolean {
+  if (
+    binding.observation_state !== observation.state ||
+    binding.observation_source !== "codex" ||
+    binding.observation_turn_id !== observation.turn_id ||
+    binding.observation_observed_at === null
+  ) {
+    return false;
+  }
+  const observedAt = Date.parse(binding.observation_observed_at);
+  return Number.isFinite(observedAt) && observedAt === Date.parse(observation.observed_at);
+}
+
+async function reconcileObservation(
+  plane: PlaneClient,
+  target: ThreadTarget,
+  bindingId: string,
+  observation: PlaneObservation,
+  log: EventLogger
+): Promise<number> {
+  let bindings: PlaneBinding[];
+  try {
+    bindings = await plane.listBindings(target);
+  } catch (error) {
+    if (error instanceof ChatSyncError && error.code === "plane_auth_failed") throw error;
+    log({
+      event: "observation_reconcile_failed",
+      threadId: target.threadId,
+      issueId: target.issueId,
+      code: codeForError(error),
+    });
+    return 1;
+  }
+
+  let remote: PlaneBinding | null;
+  try {
+    remote = findRemoteBinding(bindings, target);
+  } catch (error) {
+    log({
+      event: "observation_reconcile_failed",
+      threadId: target.threadId,
+      issueId: target.issueId,
+      code: codeForError(error),
+    });
+    return 1;
+  }
+
+  if (remote?.id === bindingId && bindingMatchesObservation(remote, observation)) {
+    log({ event: "observation_reconciled", threadId: target.threadId, issueId: target.issueId });
+    return 0;
+  }
+
+  log({
+    event: "observation_not_applied",
+    threadId: target.threadId,
+    issueId: target.issueId,
+    code: "plane_write_not_applied",
+  });
+  return 1;
+}
+
+async function observeTurn(
+  plane: PlaneClient,
+  target: ThreadTarget,
+  binding: PlaneBinding,
+  turn: CodexTurn,
+  log: EventLogger
+): Promise<number> {
+  const observation = observationForTurn(turn);
+  if (!observation) return 0;
+
+  let result: PlaneObservationWriteResult;
+  try {
+    result = await plane.syncObservation(target, binding.id, observation);
+  } catch (error) {
+    if (error instanceof ChatSyncError && error.code === "plane_auth_failed") throw error;
+    log({
+      event: "observation_failed",
+      threadId: target.threadId,
+      issueId: target.issueId,
+      code: codeForError(error),
+    });
+    return 1;
+  }
+
+  if (result.kind === "success") {
+    log({
+      event: result.applied ? "observation_synced" : "observation_already_applied",
+      threadId: target.threadId,
+      issueId: target.issueId,
+    });
+    return 0;
+  }
+
+  if (result.kind === "uncertain") {
+    return await reconcileObservation(plane, target, binding.id, observation, log);
+  }
+
+  log({
+    event: "observation_failed",
+    threadId: target.threadId,
+    issueId: target.issueId,
+    code: result.code ?? "observation_rejected",
+  });
+  return 1;
+}
+
 async function syncTarget(
   reader: CodexReader,
   plane: PlaneClient,
@@ -159,7 +277,20 @@ async function syncTarget(
     return logSkipped(log, target, "latest_turn_not_completed");
   }
   if (state.lastObservedTurnId === newest.id) {
-    return logSkipped(log, target, "turn_already_observed");
+    const observation = observationForTurn(newest);
+    if (!observation) return logSkipped(log, target, "turn_already_observed");
+    let bindings: PlaneBinding[];
+    try {
+      bindings = await plane.listBindings(target);
+    } catch (error) {
+      return logSkipped(log, target, "observation_reconcile_failed", codeForError(error));
+    }
+    const remote = findRemoteBinding(bindings, target);
+    if (!remote || remote.sync_cursor === 0 || bindingMatchesObservation(remote, observation)) {
+      return logSkipped(log, target, "turn_already_observed");
+    }
+    const errors = await observeTurn(plane, target, remote, newest, log);
+    return { synced: errors ? 0 : 1, skipped: errors ? 1 : 0, errors };
   }
 
   const finalText = getFinalAgentText(newest.items);
@@ -202,7 +333,8 @@ async function syncTarget(
     commit(state, newest, { ...payload, cursor: remote.sync_cursor });
     await saveState();
     log({ event: "already_synced", threadId: target.threadId, issueId: target.issueId });
-    return { synced: 1, skipped: 0, errors: 0 };
+    const errors = await observeTurn(plane, target, remote, newest, log);
+    return { synced: 1, skipped: 0, errors };
   }
 
   state.pending = {
@@ -219,7 +351,8 @@ async function syncTarget(
     commit(state, newest, payload);
     await saveState();
     log({ event: "synced", threadId: target.threadId, issueId: target.issueId });
-    return { synced: 1, skipped: 0, errors: 0 };
+    const errors = await observeTurn(plane, target, writeResult.binding, newest, log);
+    return { synced: 1, skipped: 0, errors };
   }
 
   if (writeResult.kind === "rejected") {
@@ -235,7 +368,8 @@ async function syncTarget(
         commit(state, newest, payload);
         await saveState();
         log({ event: "reconciled", threadId: target.threadId, issueId: target.issueId });
-        return { synced: 1, skipped: 0, errors: 0 };
+        const errors = await observeTurn(plane, target, result.binding, newest, log);
+        return { synced: 1, skipped: 0, errors };
       }
     } catch (error) {
       if (error instanceof ChatSyncError && error.code === "plane_auth_failed") throw error;
@@ -258,7 +392,8 @@ async function syncTarget(
       commit(state, newest, payload);
       await saveState();
       log({ event: "reconciled", threadId: target.threadId, issueId: target.issueId });
-      return { synced: 1, skipped: 0, errors: 0 };
+      const errors = await observeTurn(plane, target, result.binding, newest, log);
+      return { synced: 1, skipped: 0, errors };
     }
     if (result.kind === "not_applied") delete state.pending;
     else block(state, "reconciliation_conflict");

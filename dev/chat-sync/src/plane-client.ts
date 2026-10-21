@@ -11,14 +11,31 @@ export interface PlaneBinding {
   thread_id: string;
   sync_cursor: number;
   progress: Progress;
+  observation_state: PlaneObservationState | "unknown" | "needs_action" | "failed";
+  observation_source: "manual" | "codex" | null;
+  observation_observed_at: string | null;
+  observation_turn_id: string;
   link: {
     url: string;
     title: string;
   } | null;
 }
 
+export type PlaneObservationState = "running" | "answer_available";
+
+export interface PlaneObservation {
+  state: PlaneObservationState;
+  observed_at: string;
+  turn_id: string;
+}
+
 export type PlaneWriteResult =
   | { kind: "success"; binding: PlaneBinding }
+  | { kind: "rejected"; status: number; code: string | null }
+  | { kind: "uncertain"; status: number | null };
+
+export type PlaneObservationWriteResult =
+  | { kind: "success"; binding: PlaneBinding; applied: boolean }
   | { kind: "rejected"; status: number; code: string | null }
   | { kind: "uncertain"; status: number | null };
 
@@ -37,6 +54,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function parseProgress(value: unknown): Progress {
   if (!isRecord(value)) throw new ChatSyncError("plane_read_failed");
+  if (Object.keys(value).length === 0) {
+    return { done: [], now: [], waiting: [] };
+  }
   const result: Progress = { done: [], now: [], waiting: [] };
   for (const key of ["done", "now", "waiting"] as const) {
     const items = value[key];
@@ -45,6 +65,7 @@ function parseProgress(value: unknown): Progress {
     }
     result[key] = items;
   }
+  if (Object.keys(value).length !== 3) throw new ChatSyncError("plane_read_failed");
   return result;
 }
 
@@ -55,9 +76,49 @@ function parseBinding(value: unknown): PlaneBinding {
     (value.provider !== "codex" && value.provider !== "chatgpt") ||
     typeof value.thread_id !== "string" ||
     !Number.isSafeInteger(value.sync_cursor) ||
-    (value.sync_cursor as number) < 1
+    (value.sync_cursor as number) < 0
   ) {
     throw new ChatSyncError("plane_read_failed");
+  }
+
+  let observationState: PlaneBinding["observation_state"] = "unknown";
+  if (value.observation_state !== undefined) {
+    if (
+      value.observation_state !== "unknown" &&
+      value.observation_state !== "running" &&
+      value.observation_state !== "answer_available" &&
+      value.observation_state !== "needs_action" &&
+      value.observation_state !== "failed"
+    ) {
+      throw new ChatSyncError("plane_read_failed");
+    }
+    observationState = value.observation_state;
+  }
+
+  let observationSource: PlaneBinding["observation_source"] = null;
+  if (value.observation_source !== undefined) {
+    if (
+      value.observation_source !== null &&
+      value.observation_source !== "manual" &&
+      value.observation_source !== "codex"
+    ) {
+      throw new ChatSyncError("plane_read_failed");
+    }
+    observationSource = value.observation_source;
+  }
+
+  let observationObservedAt: string | null = null;
+  if (value.observation_observed_at !== undefined) {
+    if (value.observation_observed_at !== null && typeof value.observation_observed_at !== "string") {
+      throw new ChatSyncError("plane_read_failed");
+    }
+    observationObservedAt = value.observation_observed_at;
+  }
+
+  let observationTurnId = "";
+  if (value.observation_turn_id !== undefined) {
+    if (typeof value.observation_turn_id !== "string") throw new ChatSyncError("plane_read_failed");
+    observationTurnId = value.observation_turn_id;
   }
 
   let link: PlaneBinding["link"] = null;
@@ -74,6 +135,10 @@ function parseBinding(value: unknown): PlaneBinding {
     thread_id: normalizeUuid(value.thread_id),
     sync_cursor: value.sync_cursor as number,
     progress: parseProgress(value.progress),
+    observation_state: observationState,
+    observation_source: observationSource,
+    observation_observed_at: observationObservedAt,
+    observation_turn_id: observationTurnId,
     link,
   };
 }
@@ -102,6 +167,17 @@ export class PlaneClient {
       `/api/v1/workspaces/${encodeURIComponent(target.workspaceSlug)}` +
         `/projects/${encodeURIComponent(normalizeUuid(target.projectId))}` +
         `/work-items/${encodeURIComponent(normalizeUuid(target.issueId))}/chat-bindings/`
+    );
+    return new URL(path, this.baseUrl.origin).toString();
+  }
+
+  private observationUrl(target: ThreadTarget, bindingId: string): string {
+    const path = joinPath(
+      this.baseUrl.pathname,
+      `/api/v1/workspaces/${encodeURIComponent(target.workspaceSlug)}` +
+        `/projects/${encodeURIComponent(normalizeUuid(target.projectId))}` +
+        `/work-items/${encodeURIComponent(normalizeUuid(target.issueId))}` +
+        `/chat-bindings/${encodeURIComponent(bindingId)}/observations/`
     );
     return new URL(path, this.baseUrl.origin).toString();
   }
@@ -187,6 +263,57 @@ export class PlaneClient {
           return { kind: "uncertain", status: response.status };
         }
         return { kind: "success", binding };
+      } catch {
+        return { kind: "uncertain", status: response.status };
+      }
+    }
+
+    if (response.status >= 500 || response.status === 408 || response.status === 425) {
+      return { kind: "uncertain", status: response.status };
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      throw new ChatSyncError("plane_auth_failed");
+    }
+
+    let code: string | null = null;
+    try {
+      const body: unknown = JSON.parse(await this.responseText(response));
+      if (isRecord(body) && typeof body.code === "string" && /^[a-z_]{1,64}$/.test(body.code)) {
+        code = body.code;
+      }
+    } catch {
+      code = null;
+    }
+    return { kind: "rejected", status: response.status, code };
+  }
+
+  async syncObservation(
+    target: ThreadTarget,
+    bindingId: string,
+    observation: PlaneObservation
+  ): Promise<PlaneObservationWriteResult> {
+    let response: Response;
+    try {
+      response = await this.request(this.observationUrl(target, bindingId), {
+        method: "POST",
+        body: JSON.stringify(observation),
+      });
+    } catch {
+      return { kind: "uncertain", status: null };
+    }
+
+    if (response.status === 200) {
+      try {
+        const body: unknown = JSON.parse(await this.responseText(response));
+        if (!isRecord(body) || typeof body.applied !== "boolean") {
+          return { kind: "uncertain", status: response.status };
+        }
+        return {
+          kind: "success",
+          binding: parseBinding(body),
+          applied: body.applied,
+        };
       } catch {
         return { kind: "uncertain", status: response.status };
       }

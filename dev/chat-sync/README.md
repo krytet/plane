@@ -97,6 +97,12 @@ POST /api/v1/workspaces/{workspaceSlug}/projects/{projectId}/work-items/{issueId
 
 The request header is `X-Api-Key`, and the body contains only `provider`,
 `thread_id`, `url`, optional `title`, `cursor`, and the parsed `progress` object.
+After a completed progress update is confirmed, the adapter also sends a
+typed `answer_available` observation to the existing binding's
+`/observations/` endpoint. An uncertain observation is reconciled with GET
+before any later attempt. A manually created binding with cursor `0` and
+empty progress is accepted. Running turns do not generate observations yet;
+no workflow state is changed.
 
 ## Run
 

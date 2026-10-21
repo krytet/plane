@@ -4,7 +4,13 @@ import test from "node:test";
 import type { CodexReader, CodexTurn } from "../src/app-server.ts";
 import type { AdapterConfig, ThreadTarget } from "../src/config.ts";
 import { ChatSyncError } from "../src/errors.ts";
-import type { PlaneBinding, PlaneClient, PlaneWriteResult } from "../src/plane-client.ts";
+import type {
+  PlaneBinding,
+  PlaneClient,
+  PlaneObservation,
+  PlaneObservationWriteResult,
+  PlaneWriteResult,
+} from "../src/plane-client.ts";
 import type { PlanePayload, SyncState } from "../src/state.ts";
 import { runCycle } from "../src/sync.ts";
 
@@ -79,16 +85,38 @@ function asBinding(payload: PlanePayload): PlaneBinding {
     thread_id: payload.thread_id,
     sync_cursor: payload.cursor,
     progress: payload.progress,
+    observation_state: "unknown",
+    observation_source: null,
+    observation_observed_at: null,
+    observation_turn_id: "",
     link: { url: payload.url, title: payload.title ?? "Codex task" },
+  };
+}
+
+function manualBinding(): PlaneBinding {
+  return {
+    id: "binding-manual",
+    provider: "codex",
+    thread_id: TARGET.threadId,
+    sync_cursor: 0,
+    progress: { done: [], now: [], waiting: [] },
+    observation_state: "unknown",
+    observation_source: null,
+    observation_observed_at: null,
+    observation_turn_id: "",
+    link: { url: TARGET.url, title: TARGET.title ?? "Codex task" },
   };
 }
 
 class FakePlane {
   remote: PlaneBinding | null = null;
   posts: PlanePayload[] = [];
+  observations: Array<{ target: ThreadTarget; bindingId: string; observation: PlaneObservation }> = [];
   gets = 0;
   mode: "success" | "uncertain" | "rejected" = "success";
+  observationMode: "success" | "uncertain" | "rejected" = "success";
   markUncertainAsApplied = false;
+  markObservationUncertainAsApplied = false;
 
   async listBindings(): Promise<PlaneBinding[]> {
     this.gets += 1;
@@ -98,14 +126,53 @@ class FakePlane {
   async syncBinding(_target: ThreadTarget, payload: PlanePayload): Promise<PlaneWriteResult> {
     this.posts.push(structuredClone(payload));
     if (this.mode === "success") {
-      this.remote = asBinding(payload);
+      this.remote = { ...asBinding(payload), id: this.remote?.id ?? "binding-1" };
       return { kind: "success", binding: structuredClone(this.remote) };
     }
     if (this.mode === "rejected") {
       return { kind: "rejected", status: 409, code: "cursor_reused" };
     }
-    if (this.markUncertainAsApplied) this.remote = asBinding(payload);
+    if (this.markUncertainAsApplied) {
+      this.remote = { ...asBinding(payload), id: this.remote?.id ?? "binding-1" };
+    }
     return { kind: "uncertain", status: 503 };
+  }
+
+  async syncObservation(
+    target: ThreadTarget,
+    bindingId: string,
+    observation: PlaneObservation
+  ): Promise<PlaneObservationWriteResult> {
+    this.observations.push({
+      target: structuredClone(target),
+      bindingId,
+      observation: structuredClone(observation),
+    });
+    if (this.observationMode === "rejected") {
+      return { kind: "rejected", status: 409, code: "stale_observation" };
+    }
+    if (this.observationMode === "uncertain") {
+      if (this.markObservationUncertainAsApplied && this.remote) {
+        this.remote = this.withObservation(this.remote, observation);
+      }
+      return { kind: "uncertain", status: 503 };
+    }
+    this.remote = this.withObservation(this.remote ?? manualBinding(), observation);
+    return {
+      kind: "success",
+      binding: structuredClone(this.remote),
+      applied: true,
+    };
+  }
+
+  private withObservation(binding: PlaneBinding, observation: PlaneObservation): PlaneBinding {
+    return {
+      ...binding,
+      observation_state: observation.state,
+      observation_source: "codex",
+      observation_observed_at: observation.observed_at,
+      observation_turn_id: observation.turn_id,
+    };
   }
 }
 
@@ -128,6 +195,8 @@ test("posts only the explicit status block after a completed final turn", async 
   assert.equal(result.synced, 1);
   assert.equal(result.errors, 0);
   assert.equal(plane.posts.length, 1);
+  assert.equal(plane.observations.length, 1);
+  assert.equal(plane.observations[0]?.observation.state, "answer_available");
   assert.deepEqual(plane.posts[0]?.progress, {
     done: ["API endpoint"],
     now: ["Mock tests"],
@@ -146,10 +215,11 @@ test("a completed turn is not posted twice", async () => {
   const result = await runCycle(reader, plane as unknown as PlaneClient, CONFIG, state, save);
 
   assert.equal(plane.posts.length, 1);
+  assert.equal(plane.observations.length, 1);
   assert.equal(result.skipped, 1);
 });
 
-test("does not post while the latest turn is still in progress", async () => {
+test("does not observe or post while the latest turn is still in progress", async () => {
   const reader = new FakeReader();
   reader.turns = [{ ...completedTurn(), status: "inProgress", completedAt: null }];
   const plane = new FakePlane();
@@ -157,8 +227,27 @@ test("does not post while the latest turn is still in progress", async () => {
   const result = await runCycle(reader, plane as unknown as PlaneClient, CONFIG, initialState(), async () => undefined);
 
   assert.equal(plane.posts.length, 0);
+  assert.equal(plane.observations.length, 0);
   assert.equal(plane.gets, 0);
   assert.equal(result.skipped, 1);
+});
+
+test("updates an existing cursor-zero binding and posts the completed observation", async () => {
+  const reader = new FakeReader();
+  const plane = new FakePlane();
+  plane.remote = manualBinding();
+  const state = initialState();
+
+  const result = await runCycle(reader, plane as unknown as PlaneClient, CONFIG, state, save);
+
+  assert.equal(result.synced, 1);
+  assert.equal(result.errors, 0);
+  assert.equal(plane.posts.length, 1);
+  assert.ok((plane.posts[0]?.cursor ?? 0) > 0);
+  assert.equal(plane.observations.length, 1);
+  assert.equal(plane.observations[0]?.bindingId, "binding-manual");
+  assert.equal(plane.observations[0]?.observation.state, "answer_available");
+  assert.equal(plane.observations[0]?.observation.observed_at, new Date(1_800_000_000 * 1_000).toISOString());
 });
 
 test("does not post a completed turn without a status block", async () => {
@@ -170,6 +259,8 @@ test("does not post a completed turn without a status block", async () => {
   await runCycle(reader, plane as unknown as PlaneClient, CONFIG, state, async () => undefined);
 
   assert.equal(plane.posts.length, 0);
+  assert.equal(plane.observations.length, 0);
+  assert.equal(plane.gets, 0);
   assert.equal(
     state.bindings["codex:thread-1:workspace:00000000-0000-4000-8000-000000000000:00000000-0000-4000-8000-000000000001"]
       ?.lastObservedTurnId,
@@ -188,12 +279,80 @@ test("reconciles an uncertain write with GET instead of blindly retrying", async
 
   assert.equal(plane.posts.length, 1);
   assert.equal(plane.gets, 2);
+  assert.equal(plane.observations.length, 1);
   assert.equal(result.synced, 1);
   assert.equal(
     state.bindings["codex:thread-1:workspace:00000000-0000-4000-8000-000000000000:00000000-0000-4000-8000-000000000001"]
       ?.pending,
     undefined
   );
+});
+
+test("keeps a committed progress write when the follow-up observation is rejected", async () => {
+  const reader = new FakeReader();
+  const plane = new FakePlane();
+  plane.observationMode = "rejected";
+  const state = initialState();
+
+  const result = await runCycle(reader, plane as unknown as PlaneClient, CONFIG, state, save);
+
+  assert.equal(plane.posts.length, 1);
+  assert.equal(plane.observations.length, 1);
+  assert.equal(result.synced, 1);
+  assert.equal(result.errors, 1);
+  assert.equal(
+    state.bindings["codex:thread-1:workspace:00000000-0000-4000-8000-000000000000:00000000-0000-4000-8000-000000000001"]
+      ?.pending,
+    undefined
+  );
+});
+
+test("reconciles before retrying a completed observation on the next cycle", async () => {
+  const reader = new FakeReader();
+  const plane = new FakePlane();
+  plane.observationMode = "rejected";
+  const state = initialState();
+
+  await runCycle(reader, plane as unknown as PlaneClient, CONFIG, state, save);
+  plane.observationMode = "success";
+  const second = await runCycle(reader, plane as unknown as PlaneClient, CONFIG, state, save);
+  const third = await runCycle(reader, plane as unknown as PlaneClient, CONFIG, state, save);
+
+  assert.equal(plane.posts.length, 1);
+  assert.equal(plane.observations.length, 2);
+  assert.equal(second.errors, 0);
+  assert.equal(third.skipped, 1);
+});
+
+test("reconciles an uncertain observation with GET instead of retrying POST", async () => {
+  const reader = new FakeReader();
+  const plane = new FakePlane();
+  plane.observationMode = "uncertain";
+  plane.markObservationUncertainAsApplied = true;
+  const state = initialState();
+
+  const result = await runCycle(reader, plane as unknown as PlaneClient, CONFIG, state, save);
+
+  assert.equal(plane.posts.length, 1);
+  assert.equal(plane.observations.length, 1);
+  assert.equal(plane.gets, 2);
+  assert.equal(result.synced, 1);
+  assert.equal(result.errors, 0);
+});
+
+test("reports an uncertain observation that GET proves was not applied", async () => {
+  const reader = new FakeReader();
+  const plane = new FakePlane();
+  plane.observationMode = "uncertain";
+  const state = initialState();
+
+  const result = await runCycle(reader, plane as unknown as PlaneClient, CONFIG, state, save);
+
+  assert.equal(plane.posts.length, 1);
+  assert.equal(plane.observations.length, 1);
+  assert.equal(plane.gets, 2);
+  assert.equal(result.synced, 1);
+  assert.equal(result.errors, 1);
 });
 
 test("reports ChatGPT before starting any read", async () => {

@@ -28,22 +28,30 @@ const PAYLOAD: PlanePayload = {
   },
 };
 
+const OBSERVATION = {
+  state: "running" as const,
+  observed_at: "2026-10-21T12:00:00.000Z",
+  turn_id: "turn-1",
+};
+
+const BINDING_RESPONSE = {
+  id: "binding-1",
+  provider: "codex",
+  thread_id: TARGET.threadId,
+  sync_cursor: PAYLOAD.cursor,
+  progress: PAYLOAD.progress,
+  link: { url: TARGET.url, title: TARGET.title },
+  applied: true,
+};
+
 test("uses the API-key work-item endpoint without putting the key in the body", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const fetchImpl = async (input: string | URL | Request, init: RequestInit = {}) => {
     calls.push({ url: String(input), init });
-    return new Response(
-      JSON.stringify({
-        id: "binding-1",
-        provider: "codex",
-        thread_id: TARGET.threadId,
-        sync_cursor: PAYLOAD.cursor,
-        progress: PAYLOAD.progress,
-        link: { url: TARGET.url, title: TARGET.title },
-        applied: true,
-      }),
-      { status: 201, headers: { "Content-Type": "application/json" } }
-    );
+    return new Response(JSON.stringify(BINDING_RESPONSE), {
+      status: 201,
+      headers: { "Content-Type": "application/json" },
+    });
   };
 
   const client = new PlaneClient({
@@ -80,6 +88,119 @@ test("returns uncertain once on network failure without retrying", async () => {
   });
 
   const result = await client.syncBinding(TARGET, PAYLOAD);
+
+  assert.deepEqual(result, { kind: "uncertain", status: null });
+  assert.equal(calls, 1);
+});
+
+test("parses an existing manual binding with cursor zero and empty progress", async () => {
+  const fetchImpl = async () =>
+    new Response(
+      JSON.stringify([
+        {
+          id: "binding-manual",
+          provider: "codex",
+          thread_id: TARGET.threadId,
+          sync_cursor: 0,
+          progress: {},
+          link: null,
+        },
+      ]),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  const client = new PlaneClient({
+    baseUrl: "https://plane.example.com",
+    apiKey: "test-api-key",
+    fetchImpl: fetchImpl as typeof fetch,
+  });
+
+  const bindings = await client.listBindings(TARGET);
+
+  assert.equal(bindings.length, 1);
+  assert.equal(bindings[0]?.sync_cursor, 0);
+  assert.deepEqual(bindings[0]?.progress, { done: [], now: [], waiting: [] });
+});
+
+test("rejects partially initialized progress", async () => {
+  const fetchImpl = async () =>
+    new Response(
+      JSON.stringify([
+        {
+          id: "binding-partial",
+          provider: "codex",
+          thread_id: TARGET.threadId,
+          sync_cursor: 0,
+          progress: { done: ["Only one bucket"] },
+          link: null,
+        },
+      ]),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  const client = new PlaneClient({
+    baseUrl: "https://plane.example.com",
+    apiKey: "test-api-key",
+    fetchImpl: fetchImpl as typeof fetch,
+  });
+
+  await assert.rejects(
+    client.listBindings(TARGET),
+    (error: unknown) =>
+      error instanceof Error && "code" in error && (error as { code?: unknown }).code === "plane_read_failed"
+  );
+});
+
+test("posts a typed observation to the existing binding endpoint", async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fetchImpl = async (input: string | URL | Request, init: RequestInit = {}) => {
+    calls.push({ url: String(input), init });
+    return new Response(
+      JSON.stringify({
+        id: "binding-manual",
+        provider: "codex",
+        thread_id: TARGET.threadId,
+        sync_cursor: 0,
+        progress: {},
+        link: null,
+        applied: true,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  };
+  const client = new PlaneClient({
+    baseUrl: "https://plane.example.com/prefix",
+    apiKey: "test-api-key",
+    fetchImpl: fetchImpl as typeof fetch,
+  });
+
+  const result = await client.syncObservation(TARGET, "binding-manual", OBSERVATION);
+
+  assert.equal(result.kind, "success");
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0]?.url,
+    "https://plane.example.com/prefix/api/v1/workspaces/workspace/projects/00000000-0000-4000-8000-000000000000/work-items/00000000-0000-4000-8000-000000000001/chat-bindings/binding-manual/observations/"
+  );
+  const firstCall = calls[0];
+  assert.ok(firstCall);
+  assert.equal(firstCall.init.method, "POST");
+  assert.equal((firstCall.init.headers as Record<string, string>)["X-Api-Key"], "test-api-key");
+  assert.deepEqual(JSON.parse(String(firstCall.init.body)), OBSERVATION);
+  assert.doesNotMatch(String(firstCall.init.body), /test-api-key/);
+});
+
+test("returns uncertain once for an observation network failure", async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    throw new Error("network down");
+  };
+  const client = new PlaneClient({
+    baseUrl: "https://plane.example.com",
+    apiKey: "test-api-key",
+    fetchImpl: fetchImpl as typeof fetch,
+  });
+
+  const result = await client.syncObservation(TARGET, "binding-manual", OBSERVATION);
 
   assert.deepEqual(result, { kind: "uncertain", status: null });
   assert.equal(calls, 1);
