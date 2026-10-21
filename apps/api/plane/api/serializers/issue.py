@@ -32,7 +32,11 @@ from plane.utils.content_validator import (
     validate_html_content,
     validate_binary_data,
 )
-from plane.utils.issue_chat import IssueChatInputError, normalize_chat_binding_url
+from plane.utils.issue_chat import (
+    IssueChatInputError,
+    normalize_chat_binding_url,
+    redact_issue_description_fields,
+)
 
 from .base import BaseSerializer
 from .cycle import CycleLiteSerializer, CycleSerializer
@@ -350,6 +354,8 @@ class IssueSerializer(BaseSerializer):
                     str(label) for label in IssueLabel.objects.filter(issue=instance).values_list("label_id", flat=True)
                 ]
 
+        if self.context.get("can_view_chat_progress", True) is False:
+            redact_issue_description_fields(data)
         return data
 
 
@@ -542,7 +548,7 @@ class IssueChatBindingSyncSerializer(serializers.Serializer):
     thread_id = serializers.CharField(max_length=255, trim_whitespace=True)
     url = serializers.CharField(max_length=2048, required=False, allow_blank=False)
     title = serializers.CharField(max_length=255, trim_whitespace=True, required=False, allow_blank=True)
-    cursor = serializers.IntegerField(min_value=1)
+    cursor = serializers.IntegerField(min_value=1, max_value=9223372036854775807)
     progress = IssueChatProgressSerializer()
 
     def validate_thread_id(self, value):

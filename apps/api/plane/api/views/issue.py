@@ -98,8 +98,10 @@ from plane.utils.issue_chat import (
     IssueChatConflict,
     IssueChatInputError,
     IssueChatNotFound,
+    can_view_issue_chat_progress,
     list_issue_chat_bindings,
-    merge_latest_chat_blocks,
+    merge_latest_chat_description,
+    redact_issue_description_fields,
     sync_issue_chat_binding,
 )
 from plane.bgtasks.webhook_task import model_activity
@@ -189,6 +191,16 @@ def user_has_issue_permission(user_id, project_id, issue=None, allowed_roles=Non
     return qs.exists()
 
 
+def _issue_chat_progress_context(user, workspace_slug, project_id):
+    return {
+        "can_view_chat_progress": can_view_issue_chat_progress(
+            user,
+            workspace_slug,
+            project_id,
+        )
+    }
+
+
 class WorkspaceIssueAPIEndpoint(BaseAPIView):
     """
     This viewset provides `retrieveByIssueId` on workspace level
@@ -265,9 +277,25 @@ class WorkspaceIssueAPIEndpoint(BaseAPIView):
                 sequence_id=issue_identifier,
             )
             return Response(
-                IssueSerializer(issue, fields=self.fields, expand=self.expand).data,
+                _redact_for_restricted_issue_reader(
+                    IssueSerializer(
+                        issue,
+                        fields=self.fields,
+                        expand=self.expand,
+                        context=_issue_chat_progress_context(request.user, slug, issue.project_id),
+                    ).data,
+                    request.user,
+                    slug,
+                    issue.project_id,
+                ),
                 status=status.HTTP_200_OK,
             )
+
+
+def _redact_for_restricted_issue_reader(data, user, workspace_slug, project_id):
+    if not can_view_issue_chat_progress(user, workspace_slug, project_id):
+        redact_issue_description_fields(data)
+    return data
 
 
 class IssueListCreateAPIEndpoint(BaseAPIView):
@@ -356,7 +384,17 @@ class IssueListCreateAPIEndpoint(BaseAPIView):
                 project_id=project_id,
             )
             return Response(
-                IssueSerializer(issue, fields=self.fields, expand=self.expand).data,
+                _redact_for_restricted_issue_reader(
+                    IssueSerializer(
+                        issue,
+                        fields=self.fields,
+                        expand=self.expand,
+                        context=_issue_chat_progress_context(request.user, slug, project_id),
+                    ).data,
+                    request.user,
+                    slug,
+                    project_id,
+                ),
                 status=status.HTTP_200_OK,
             )
 
@@ -437,11 +475,26 @@ class IssueListCreateAPIEndpoint(BaseAPIView):
         else:
             issue_queryset = issue_queryset.order_by(order_by_param)
 
+        can_view_chat_progress = can_view_issue_chat_progress(request.user, slug, project_id)
+
+        def serialize_issues(issues):
+            data = IssueSerializer(
+                issues,
+                many=True,
+                fields=self.fields,
+                expand=self.expand,
+                context={"can_view_chat_progress": can_view_chat_progress},
+            ).data
+            if not can_view_chat_progress:
+                for issue_data in data:
+                    redact_issue_description_fields(issue_data)
+            return data
+
         return self.paginate(
             request=request,
             queryset=(issue_queryset),
             total_count_queryset=total_issue_queryset,
-            on_results=lambda issues: IssueSerializer(issues, many=True, fields=self.fields, expand=self.expand).data,
+            on_results=serialize_issues,
         )
 
     @work_item_docs(
@@ -603,7 +656,17 @@ class IssueDetailAPIEndpoint(BaseAPIView):
             .values("count")
         ).get(workspace__slug=slug, project_id=project_id, pk=pk)
         return Response(
-            IssueSerializer(issue, fields=self.fields, expand=self.expand).data,
+            _redact_for_restricted_issue_reader(
+                IssueSerializer(
+                    issue,
+                    fields=self.fields,
+                    expand=self.expand,
+                    context=_issue_chat_progress_context(request.user, slug, project_id),
+                ).data,
+                request.user,
+                slug,
+                project_id,
+            ),
             status=status.HTTP_200_OK,
         )
 
@@ -670,6 +733,7 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                 )
                 if serializer.is_valid():
                     merged_description = None
+                    merged_description_json = None
                     try:
                         if "description_html" in serializer.validated_data:
                             with transaction.atomic():
@@ -687,12 +751,15 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                                     IssueSerializer(issue).data,
                                     cls=DjangoJSONEncoder,
                                 )
-                                merged_description = merge_latest_chat_blocks(
+                                merged_description, merged_description_json = merge_latest_chat_description(
                                     issue,
                                     serializer.validated_data["description_html"],
+                                    serializer.validated_data.get("description_json"),
                                 )
                                 serializer.instance = issue
                                 serializer.validated_data["description_html"] = merged_description
+                                if merged_description_json is not None:
+                                    serializer.validated_data["description_json"] = merged_description_json
                                 serializer.save()
                         else:
                             serializer.save()
@@ -706,6 +773,8 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                     accepted_data = writable_data(serializer, request.data)
                     if merged_description is not None:
                         accepted_data["description_html"] = merged_description
+                        if merged_description_json is not None:
+                            accepted_data["description_json"] = merged_description_json
                     issue_activity.delay(
                         type="issue.activity.updated",
                         requested_data=json.dumps(accepted_data, cls=DjangoJSONEncoder),
@@ -829,7 +898,11 @@ class IssueDetailAPIEndpoint(BaseAPIView):
         serializer = IssueSerializer(
             issue,
             data=request.data,
-            context={"project_id": project_id, "workspace_id": project.workspace_id},
+            context={
+                "project_id": project_id,
+                "workspace_id": project.workspace_id,
+                **_issue_chat_progress_context(request.user, slug, project_id),
+            },
             partial=True,
         )
         if serializer.is_valid():
@@ -852,6 +925,7 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                 )
 
             merged_description = None
+            merged_description_json = None
             try:
                 if "description_html" in serializer.validated_data:
                     with transaction.atomic():
@@ -866,12 +940,15 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                                 status=status.HTTP_404_NOT_FOUND,
                             )
                         current_instance = json.dumps(IssueSerializer(issue).data, cls=DjangoJSONEncoder)
-                        merged_description = merge_latest_chat_blocks(
+                        merged_description, merged_description_json = merge_latest_chat_description(
                             issue,
                             serializer.validated_data["description_html"],
+                            serializer.validated_data.get("description_json"),
                         )
                         serializer.instance = issue
                         serializer.validated_data["description_html"] = merged_description
+                        if merged_description_json is not None:
+                            serializer.validated_data["description_json"] = merged_description_json
                         serializer.save()
                 else:
                     serializer.save()
@@ -885,6 +962,8 @@ class IssueDetailAPIEndpoint(BaseAPIView):
             accepted_data = writable_data(serializer, request.data)
             if merged_description is not None:
                 accepted_data["description_html"] = merged_description
+                if merged_description_json is not None:
+                    accepted_data["description_json"] = merged_description_json
             issue_activity.delay(
                 type="issue.activity.updated",
                 requested_data=json.dumps(accepted_data, cls=DjangoJSONEncoder),

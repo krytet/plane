@@ -1,5 +1,5 @@
 import type { AdapterConfig, ThreadTarget } from "./config.ts";
-import { assertSupportedProviders } from "./config.ts";
+import { assertSupportedProviders, normalizeUuid } from "./config.ts";
 import { ChatSyncError, codeForError } from "./errors.ts";
 import type { CodexReader, CodexTurn } from "./app-server.ts";
 import type { PlaneBinding, PlaneClient } from "./plane-client.ts";
@@ -34,7 +34,8 @@ type ReconcileResult = { kind: "applied"; binding: PlaneBinding } | { kind: "not
 
 function findRemoteBinding(bindings: PlaneBinding[], target: ThreadTarget): PlaneBinding | null {
   const matches = bindings.filter(
-    (binding) => binding.provider === target.provider && binding.thread_id === target.threadId
+    (binding) =>
+      binding.provider === target.provider && normalizeUuid(binding.thread_id) === normalizeUuid(target.threadId)
   );
   if (matches.length > 1) throw new ChatSyncError("reconciliation_conflict");
   return matches[0] ?? null;
@@ -190,7 +191,7 @@ async function syncTarget(
   const cursor = nextCursor(floor, newest.completedAt);
   const payload: PlanePayload = {
     provider: "codex",
-    thread_id: target.threadId,
+    thread_id: normalizeUuid(target.threadId),
     url: target.url,
     ...(target.title ? { title: target.title } : {}),
     cursor,

@@ -36,6 +36,7 @@ from plane.utils.content_validator import (
     validate_html_content,
     validate_binary_data,
 )
+from plane.utils.issue_chat import redact_issue_description_fields
 
 
 class IssueStateFlatSerializer(BaseSerializer):
@@ -448,6 +449,9 @@ class IssuePublicSerializer(BaseSerializer):
             "assignee_ids",
         ]
         read_only_fields = fields
+
+    def to_representation(self, instance):
+        return redact_issue_description_fields(super().to_representation(instance))
 
 
 class LabelLiteSerializer(BaseSerializer):

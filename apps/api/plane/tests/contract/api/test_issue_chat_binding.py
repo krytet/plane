@@ -22,6 +22,7 @@ from plane.db.models import (
     Workspace,
     WorkspaceMember,
 )
+from plane.utils.issue_chat import can_view_issue_chat_progress
 
 
 def _user(prefix):
@@ -338,6 +339,7 @@ def test_api_chat_bindings_deny_project_guests_even_with_full_feature_access(ten
     WorkspaceMember.objects.create(workspace=tenant["workspace"], member=guest, role=5)
     ProjectMember.objects.create(project=tenant["project"], workspace=tenant["workspace"], member=guest, role=5)
     guest_client = _client_for(guest)
+    assert not can_view_issue_chat_progress(guest, tenant["workspace"].slug, tenant["project"].id)
 
     listed = guest_client.get(_url(tenant["workspace"], tenant["issue"]))
     posted = guest_client.post(
@@ -349,3 +351,70 @@ def test_api_chat_bindings_deny_project_guests_even_with_full_feature_access(ten
     assert listed.status_code == status.HTTP_403_FORBIDDEN
     assert posted.status_code == status.HTTP_403_FORBIDDEN
     assert IssueChatBinding.objects.filter(issue=tenant["issue"]).count() == 1
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_api_sync_canonicalizes_codex_uuid_thread_ids(tenant):
+    thread_id = str(uuid4()).upper()
+    payload = _payload(cursor=1)
+    payload["thread_id"] = thread_id
+    payload.pop("url")
+
+    response = tenant["client"].post(_url(tenant["workspace"], tenant["issue"]), payload, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED, response.content
+    binding = IssueChatBinding.objects.get(pk=response.data["id"])
+    assert binding.thread_id == thread_id.lower()
+    assert binding.link.url == f"codex://threads/{thread_id.lower()}"
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_api_sync_rejects_cursor_above_database_integer_bound(tenant):
+    payload = {**_payload(cursor=1), "cursor": 9223372036854775808}
+
+    response = tenant["client"].post(_url(tenant["workspace"], tenant["issue"]), payload, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "cursor" in response.data
+    assert not IssueChatBinding.objects.filter(issue=tenant["issue"]).exists()
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_api_guest_work_item_list_and_detail_redact_generated_progress(tenant):
+    issue = tenant["issue"]
+    synced = tenant["client"].post(_url(tenant["workspace"], issue), _payload(cursor=1), format="json")
+    assert synced.status_code == status.HTTP_201_CREATED, synced.content
+
+    list_url = f"/api/v1/workspaces/{tenant['workspace'].slug}/projects/{issue.project_id}/work-items/"
+    owner_list = tenant["client"].get(list_url)
+    owner_detail = tenant["client"].get(_work_item_url(tenant["workspace"], issue))
+    assert owner_list.status_code == status.HTTP_200_OK, owner_list.content
+    assert owner_detail.status_code == status.HTTP_200_OK, owner_detail.content
+    assert "Backend model" in str(owner_list.data)
+    assert "Backend model" in owner_detail.data["description_html"]
+
+    tenant["project"].guest_view_all_features = True
+    tenant["project"].save(update_fields=["guest_view_all_features"])
+    guest = _user("api-guest")
+    WorkspaceMember.objects.create(workspace=tenant["workspace"], member=guest, role=5)
+    ProjectMember.objects.create(project=tenant["project"], workspace=tenant["workspace"], member=guest, role=5)
+    guest_client = _client_for(guest)
+
+    guest_list = guest_client.get(list_url)
+    guest_detail = guest_client.get(_work_item_url(tenant["workspace"], issue))
+
+    assert guest_list.status_code == status.HTTP_200_OK, guest_list.content
+    assert guest_detail.status_code == status.HTTP_200_OK, guest_detail.content
+    guest_list_html = str(guest_list.data["results"][0]["description_html"])
+    guest_detail_html = str(guest_detail.data["description_html"])
+    assert "Manual description." in guest_list_html
+    assert "Backend model" not in guest_list_html
+    assert "Focused tests" not in guest_list_html
+    assert "chat-progress" not in guest_list_html
+    assert "Manual description." in guest_detail_html
+    assert "Backend model" not in guest_detail_html
+    assert "Focused tests" not in guest_detail_html
+    assert "chat-progress" not in guest_detail_html

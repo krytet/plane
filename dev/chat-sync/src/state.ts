@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-import type { ThreadTarget } from "./config.ts";
+import { normalizeUuid, type ThreadTarget } from "./config.ts";
 import { ChatSyncError } from "./errors.ts";
 import type { Progress } from "./status-block.ts";
 
@@ -39,6 +39,8 @@ export interface SyncState {
   bindings: Record<string, BindingState>;
 }
 
+export const MAX_CURSOR = Number.MAX_SAFE_INTEGER;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -63,7 +65,13 @@ function assertBindingState(value: unknown): asserts value is BindingState {
 }
 
 export function bindingKey(target: ThreadTarget): string {
-  return [target.provider, target.threadId, target.workspaceSlug, target.projectId, target.issueId].join(":");
+  return [
+    target.provider,
+    normalizeUuid(target.threadId),
+    target.workspaceSlug,
+    normalizeUuid(target.projectId),
+    normalizeUuid(target.issueId),
+  ].join(":");
 }
 
 export function getBindingState(state: SyncState, target: ThreadTarget): BindingState {
@@ -72,10 +80,20 @@ export function getBindingState(state: SyncState, target: ThreadTarget): Binding
 
 export function nextCursor(floor: number, completedAt: number): number {
   const timestampCursor = Math.trunc(completedAt);
-  if (!Number.isSafeInteger(timestampCursor) || timestampCursor < 1) {
+  if (
+    !Number.isSafeInteger(floor) ||
+    floor < 0 ||
+    floor >= MAX_CURSOR ||
+    !Number.isSafeInteger(timestampCursor) ||
+    timestampCursor < 1
+  ) {
     throw new ChatSyncError("protocol_incompatible");
   }
-  return Math.max(floor + 1, timestampCursor);
+  const cursor = Math.max(floor + 1, timestampCursor);
+  if (!Number.isSafeInteger(cursor) || cursor > MAX_CURSOR) {
+    throw new ChatSyncError("protocol_incompatible");
+  }
+  return cursor;
 }
 
 function canonicalPayload(payload: PlanePayload): string {

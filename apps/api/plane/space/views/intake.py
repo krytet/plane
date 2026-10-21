@@ -7,6 +7,7 @@ import json
 
 # Django import
 from django.utils import timezone
+from django.db import transaction
 from django.db.models import Q, OuterRef, Func, F, Prefetch
 from django.core.serializers.json import DjangoJSONEncoder
 
@@ -25,6 +26,13 @@ from plane.app.serializers import (
 )
 from plane.utils.content_validator import validate_html_content
 from plane.utils.issue_filters import issue_filters
+from plane.utils.issue_chat import (
+    IssueChatConflict,
+    merge_latest_chat_description,
+    redact_issue_description_fields,
+    redact_chat_progress_html,
+    redact_chat_progress_json,
+)
 from plane.bgtasks.issue_activities_task import issue_activity
 from plane.db.models.intake import SourceType
 
@@ -218,8 +226,8 @@ class IntakeIssuePublicViewSet(BaseViewSet):
         # viewers and guests since only viewers and guests
         issue_data = {
             "name": issue_data.get("name", issue.name),
-            "description_html": issue_data.get("description_html", issue.description_html),
-            "description_json": issue_data.get("description_json", issue.description_json),
+            "description_html": redact_chat_progress_html(issue_data.get("description_html", issue.description_html)),
+            "description_json": redact_chat_progress_json(issue_data.get("description_json", issue.description_json)),
         }
 
         issue_serializer = IssueCreateSerializer(
@@ -243,8 +251,35 @@ class IntakeIssuePublicViewSet(BaseViewSet):
                     current_instance=json.dumps(IssueSerializer(current_instance).data, cls=DjangoJSONEncoder),
                     epoch=int(timezone.now().timestamp()),
                 )
-            issue_serializer.save()
-            return Response(issue_serializer.data, status=status.HTTP_200_OK)
+            try:
+                with transaction.atomic():
+                    locked_issue = (
+                        Issue.objects.select_for_update(of=("self",))
+                        .filter(
+                            pk=intake_issue.issue_id,
+                            workspace_id=project_deploy_board.workspace_id,
+                            project_id=project_deploy_board.project_id,
+                        )
+                        .first()
+                    )
+                    if locked_issue is None:
+                        return Response({"error": "Work item not found"}, status=status.HTTP_404_NOT_FOUND)
+                    merged_description, merged_description_json = merge_latest_chat_description(
+                        locked_issue,
+                        issue_serializer.validated_data["description_html"],
+                        issue_serializer.validated_data.get("description_json"),
+                    )
+                    issue_serializer.instance = locked_issue
+                    issue_serializer.validated_data["description_html"] = merged_description
+                    if merged_description_json is not None:
+                        issue_serializer.validated_data["description_json"] = merged_description_json
+                    issue_serializer.save()
+            except IssueChatConflict as exc:
+                return Response(
+                    {"error": exc.message, "code": exc.code},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            return Response(redact_issue_description_fields(issue_serializer.data), status=status.HTTP_200_OK)
         return Response(issue_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     def retrieve(self, request, anchor, intake_id, pk):

@@ -8,6 +8,7 @@ from rest_framework import serializers
 # Module imports
 from .base import BaseSerializer
 from .issue import IssueIntakeSerializer, LabelLiteSerializer, IssueDetailSerializer
+from plane.utils.issue_chat import redact_issue_description_fields
 from .project import ProjectLiteSerializer
 from .state import StateLiteSerializer
 from .user import UserLiteSerializer
@@ -142,3 +143,6 @@ class IssueStateIntakeSerializer(BaseSerializer):
     class Meta:
         model = Issue
         fields = "__all__"
+
+    def to_representation(self, instance):
+        return redact_issue_description_fields(super().to_representation(instance))

@@ -47,6 +47,7 @@ from plane.utils.content_validator import (
     validate_html_content,
     validate_binary_data,
 )
+from plane.utils.issue_chat import redact_issue_activity_fields, redact_issue_description_fields
 
 
 class IssueFlatSerializer(BaseSerializer):
@@ -355,6 +356,12 @@ class IssueActivitySerializer(BaseSerializer):
                 "extra": obj.issue.source_data[0].extra,
             }
         return None
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if self.context.get("can_view_chat_progress", True) is False:
+            redact_issue_activity_fields(data)
+        return data
 
     class Meta:
         model = IssueActivity
@@ -946,6 +953,12 @@ class IssueDetailSerializer(IssueSerializer):
     is_subscribed = serializers.BooleanField(read_only=True)
     is_intake = serializers.BooleanField(read_only=True)
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not self.context.get("can_view_chat_progress", False):
+            redact_issue_description_fields(data)
+        return data
+
     class Meta(IssueSerializer.Meta):
         fields = IssueSerializer.Meta.fields + [
             "description_html",
@@ -979,6 +992,9 @@ class IssuePublicSerializer(BaseSerializer):
             "votes",
         ]
         read_only_fields = fields
+
+    def to_representation(self, instance):
+        return redact_issue_description_fields(super().to_representation(instance))
 
 
 class IssueSubscriberSerializer(BaseSerializer):
@@ -1028,6 +1044,12 @@ class IssueVersionDetailSerializer(BaseSerializer):
 
 
 class IssueDescriptionVersionDetailSerializer(BaseSerializer):
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not self.context.get("can_view_chat_progress", False):
+            redact_issue_description_fields(data)
+        return data
+
     class Meta:
         model = IssueDescriptionVersion
         fields = [

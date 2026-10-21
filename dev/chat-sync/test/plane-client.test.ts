@@ -61,6 +61,7 @@ test("uses the API-key work-item endpoint without putting the key in the body", 
   );
   const firstCall = calls[0];
   assert.ok(firstCall);
+  assert.equal(firstCall.init.redirect, "error");
   assert.equal((firstCall.init.headers as Record<string, string>)["X-Api-Key"], "test-api-key");
   assert.doesNotMatch(String(firstCall.init.body), /test-api-key/);
   assert.deepEqual(JSON.parse(String(firstCall.init.body)), PAYLOAD);

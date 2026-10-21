@@ -42,6 +42,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function normalizeUuid(value: string): string {
+  return UUID_RE.test(value) ? value.toLowerCase() : value;
+}
+
 function invalid(): never {
   throw new ChatSyncError("config_invalid");
 }
@@ -120,10 +124,10 @@ function parseThread(value: unknown): ThreadTarget {
 
   return {
     provider,
-    threadId,
+    threadId: normalizeUuid(threadId.trim()),
     workspaceSlug,
-    projectId,
-    issueId,
+    projectId: normalizeUuid(projectId),
+    issueId: normalizeUuid(issueId),
     url,
     ...(title ? { title } : {}),
   };

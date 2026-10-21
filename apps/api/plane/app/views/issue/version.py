@@ -22,6 +22,7 @@ from plane.app.serializers import (
 from plane.app.permissions import allow_permission, ROLE
 from plane.utils.global_paginator import paginate
 from plane.utils.timezone_converter import user_timezone_converter
+from plane.utils.issue_chat import can_view_issue_chat_progress
 
 
 class IssueVersionEndpoint(BaseAPIView):
@@ -112,7 +113,16 @@ class WorkItemDescriptionVersionEndpoint(BaseAPIView):
                 pk=pk,
             )
 
-            serializer = IssueDescriptionVersionDetailSerializer(issue_description_version)
+            serializer = IssueDescriptionVersionDetailSerializer(
+                issue_description_version,
+                context={
+                    "can_view_chat_progress": can_view_issue_chat_progress(
+                        request.user,
+                        slug,
+                        project_id,
+                    )
+                },
+            )
             return Response(serializer.data, status=status.HTTP_200_OK)
 
         cursor = request.GET.get("cursor", None)

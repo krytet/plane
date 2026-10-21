@@ -72,7 +72,12 @@ from plane.utils.grouper import (
 from plane.utils.host import base_host
 from plane.utils.serializers import writable_data
 from plane.utils.issue_filters import issue_filters
-from plane.utils.issue_chat import IssueChatConflict, merge_latest_chat_blocks
+from plane.utils.issue_chat import (
+    IssueChatConflict,
+    can_view_issue_chat_progress,
+    merge_latest_chat_description,
+    redact_issue_description_fields,
+)
 from plane.utils.order_queryset import order_issue_queryset
 from plane.utils.paginator import GroupedOffsetPaginator, SubGroupedOffsetPaginator
 from plane.utils.timezone_converter import user_timezone_converter
@@ -624,7 +629,17 @@ class IssueViewSet(BaseViewSet):
             project_id=project_id,
         )
 
-        serializer = IssueDetailSerializer(issue, expand=self.expand)
+        serializer = IssueDetailSerializer(
+            issue,
+            expand=self.expand,
+            context={
+                "can_view_chat_progress": can_view_issue_chat_progress(
+                    request.user,
+                    slug,
+                    project_id,
+                )
+            },
+        )
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @allow_permission(allowed_roles=[ROLE.ADMIN, ROLE.MEMBER], creator=True, model=Issue)
@@ -682,6 +697,7 @@ class IssueViewSet(BaseViewSet):
         serializer = IssueCreateSerializer(issue, data=request.data, partial=True, context={"project_id": project_id})
         if serializer.is_valid():
             merged_description = None
+            merged_description_json = None
             try:
                 if is_description_update:
                     with transaction.atomic():
@@ -694,12 +710,15 @@ class IssueViewSet(BaseViewSet):
                             return Response({"error": "Issue not found"}, status=status.HTTP_404_NOT_FOUND)
 
                         current_instance = json.dumps(IssueDetailSerializer(issue).data, cls=DjangoJSONEncoder)
-                        merged_description = merge_latest_chat_blocks(
+                        merged_description, merged_description_json = merge_latest_chat_description(
                             issue,
                             serializer.validated_data["description_html"],
+                            serializer.validated_data.get("description_json"),
                         )
                         serializer.instance = issue
                         serializer.validated_data["description_html"] = merged_description
+                        if merged_description_json is not None:
+                            serializer.validated_data["description_json"] = merged_description_json
                         serializer.save()
                 else:
                     serializer.save()
@@ -713,6 +732,8 @@ class IssueViewSet(BaseViewSet):
             accepted_data = writable_data(serializer, request.data)
             if merged_description is not None:
                 accepted_data["description_html"] = merged_description
+                if merged_description_json is not None:
+                    accepted_data["description_json"] = merged_description_json
             # Check if the update is a migration description update
             is_migration_description_update = skip_activity and is_description_update
             # Log all the updates
@@ -746,6 +767,27 @@ class IssueViewSet(BaseViewSet):
             return Response(status=status.HTTP_204_NO_CONTENT)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+    @allow_permission(allowed_roles=[ROLE.ADMIN, ROLE.MEMBER], creator=True, model=Issue)
+    def update(self, request, slug, project_id, pk=None):
+        """Keep PUT on the guarded, locked description-update path."""
+
+        response = self.partial_update.__wrapped__(self, request, slug, project_id, pk)
+        if response.status_code != status.HTTP_204_NO_CONTENT:
+            return response
+
+        issue = self.get_queryset().get(pk=pk)
+        response_serializer = IssueCreateSerializer(
+            issue,
+            data=request.data,
+            partial=True,
+            context={"project_id": project_id},
+        )
+        response_serializer.is_valid(raise_exception=True)
+        data = response_serializer.data
+        if not can_view_issue_chat_progress(request.user, slug, project_id):
+            redact_issue_description_fields(data)
+        return Response(data, status=status.HTTP_200_OK)
+
     @allow_permission([ROLE.ADMIN], creator=True, model=Issue)
     def destroy(self, request, slug, project_id, pk=None):
         issue = Issue.objects.get(workspace__slug=slug, project_id=project_id, pk=pk)
@@ -777,21 +819,11 @@ class ProjectUserDisplayPropertyEndpoint(BaseAPIView):
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST])
     def patch(self, request, slug, project_id):
         try:
-            issue_property = ProjectUserProperty.objects.get(
-                user=request.user, 
-                project_id=project_id
-            )
+            issue_property = ProjectUserProperty.objects.get(user=request.user, project_id=project_id)
         except ProjectUserProperty.DoesNotExist:
-            issue_property = ProjectUserProperty.objects.create(
-                user=request.user, 
-                project_id=project_id
-            )
+            issue_property = ProjectUserProperty.objects.create(user=request.user, project_id=project_id)
 
-        serializer = ProjectUserPropertySerializer(
-            issue_property, 
-            data=request.data,
-            partial=True
-        )
+        serializer = ProjectUserPropertySerializer(issue_property, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data, status=status.HTTP_200_OK)
@@ -885,12 +917,15 @@ class IssuePaginatedViewSet(BaseViewSet):
             )
         )
 
-    def process_paginated_result(self, fields, results, timezone):
+    def process_paginated_result(self, fields, results, timezone, can_view_chat_progress=True):
         paginated_data = results.values(*fields)
 
         # converting the datetime fields in paginated data
         datetime_fields = ["created_at", "updated_at"]
         paginated_data = user_timezone_converter(paginated_data, datetime_fields, timezone)
+        if not can_view_chat_progress:
+            for issue_data in paginated_data:
+                redact_issue_description_fields(issue_data)
 
         return paginated_data
 
@@ -932,6 +967,7 @@ class IssuePaginatedViewSet(BaseViewSet):
 
         if str(is_description_required).lower() == "true":
             required_fields.append("description_html")
+        can_view_chat_progress = can_view_issue_chat_progress(request.user, slug, project_id)
 
         # querying issues
         base_queryset = Issue.issue_objects.filter(workspace__slug=slug, project_id=project_id)
@@ -998,7 +1034,10 @@ class IssuePaginatedViewSet(BaseViewSet):
             queryset=queryset,
             cursor=cursor,
             on_result=lambda results: self.process_paginated_result(
-                required_fields, results, request.user.user_timezone
+                required_fields,
+                results,
+                request.user.user_timezone,
+                can_view_chat_progress=can_view_chat_progress,
             ),
         )
 
@@ -1396,5 +1435,15 @@ class IssueDetailIdentifierEndpoint(BaseAPIView):
         )
 
         # Serialize the issue
-        serializer = IssueDetailSerializer(issue, expand=self.expand)
+        serializer = IssueDetailSerializer(
+            issue,
+            expand=self.expand,
+            context={
+                "can_view_chat_progress": can_view_issue_chat_progress(
+                    request.user,
+                    slug,
+                    project.id,
+                )
+            },
+        )
         return Response(serializer.data, status=status.HTTP_200_OK)

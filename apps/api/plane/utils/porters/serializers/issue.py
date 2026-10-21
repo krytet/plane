@@ -7,6 +7,7 @@ from rest_framework import serializers
 
 # Module imports
 from plane.app.serializers import IssueSerializer
+from plane.utils.issue_chat import redacted_issue_description_stripped, redact_issue_description_fields
 
 
 class IssueExportSerializer(IssueSerializer):
@@ -22,6 +23,7 @@ class IssueExportSerializer(IssueSerializer):
     state_name = serializers.CharField(source='state.name', read_only=True, default="")
     created_by_name = serializers.CharField(source='created_by.full_name', read_only=True, default="")
 
+    description = serializers.SerializerMethodField()
     assignees = serializers.SerializerMethodField()
     parent = serializers.SerializerMethodField()
     labels = serializers.SerializerMethodField()
@@ -41,6 +43,7 @@ class IssueExportSerializer(IssueSerializer):
             "identifier",
             "sequence_id",
             "name",
+            "description",
             "state_name",
             "priority",
             "assignees",
@@ -65,8 +68,19 @@ class IssueExportSerializer(IssueSerializer):
             "is_draft",
         ]
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if str(instance.project_id) in self.context.get("redact_chat_progress_project_ids", set()):
+            redact_issue_description_fields(data)
+        return data
+
     def get_identifier(self, obj):
         return f"{obj.project.identifier}-{obj.sequence_id}"
+
+    def get_description(self, obj):
+        if str(obj.project_id) in self.context.get("redact_chat_progress_project_ids", set()):
+            return redacted_issue_description_stripped(obj.description_html, obj.description_stripped)
+        return obj.description_stripped or ""
 
     def get_assignees(self, obj):
         return [u.full_name for u in obj.assignees.all() if u.is_active]

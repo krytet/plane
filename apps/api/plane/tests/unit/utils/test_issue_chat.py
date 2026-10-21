@@ -16,6 +16,8 @@ from plane.utils.issue_chat import (
     normalize_provider_url,
     progress_block_hash,
     progress_block_id,
+    redact_issue_activity_fields,
+    redact_issue_description_fields,
     render_progress_block,
 )
 
@@ -168,3 +170,65 @@ def test_native_codex_url_is_synthesized_only_for_a_matching_uuid_thread():
         normalize_chat_binding_url("chatgpt", thread_id, None)
     with pytest.raises(IssueChatInputError):
         normalize_chat_binding_url("chatgpt", thread_id, native_url)
+
+
+@pytest.mark.unit
+def test_redaction_removes_every_generated_description_representation():
+    binding_id = uuid4()
+    marker_id = progress_block_id(binding_id)
+    block = render_progress_block(
+        binding_id,
+        {"done": ["Hidden done"], "now": ["Hidden now"], "waiting": []},
+    )
+    data = {
+        "description_html": f"<p>Manual text.</p>{block}",
+        "description_stripped": "Manual text. Hidden done Hidden now",
+        "description_json": {
+            "type": "doc",
+            "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "Manual text."}]},
+                {
+                    "type": "chatProgress",
+                    "attrs": {
+                        "id": marker_id,
+                        "progress": {"done": ["Hidden done"], "now": ["Hidden now"], "waiting": []},
+                    },
+                },
+            ],
+        },
+    }
+
+    redact_issue_description_fields(data)
+
+    assert data["description_html"] == "<p>Manual text.</p>"
+    assert data["description_stripped"] == "Manual text."
+    assert [node["type"] for node in data["description_json"]["content"]] == ["paragraph"]
+
+
+@pytest.mark.unit
+def test_activity_redaction_covers_history_values_and_nested_issue_detail():
+    block = render_progress_block(
+        uuid4(),
+        {"done": ["History done"], "now": ["History now"], "waiting": []},
+    )
+    data = {
+        "field": "description",
+        "old_value": "<p>Previous manual.</p>",
+        "new_value": f"<p>Manual history.</p>{block}",
+        "issue_detail": {
+            "description_html": f"<p>Nested manual.</p>{block}",
+            "description_json": {
+                "type": "doc",
+                "content": [
+                    {"type": "chat-progress", "attrs": {"id": progress_block_id(uuid4())}},
+                    {"type": "paragraph"},
+                ],
+            },
+        },
+    }
+
+    redact_issue_activity_fields(data)
+
+    assert data["new_value"] == "<p>Manual history.</p>"
+    assert data["issue_detail"]["description_html"] == "<p>Nested manual.</p>"
+    assert [node["type"] for node in data["issue_detail"]["description_json"]["content"]] == ["paragraph"]

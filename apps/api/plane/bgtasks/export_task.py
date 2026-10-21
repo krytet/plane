@@ -22,6 +22,7 @@ from django.db.models import Prefetch, Q
 from plane.app.permissions import ROLE
 from plane.db.models import ExporterHistory, Issue, IssueComment, IssueRelation, IssueSubscriber
 from plane.utils.exception_logger import log_exception
+from plane.utils.issue_chat import get_issue_chat_progress_redacted_project_ids
 from plane.utils.porters.exporter import DataExporter
 from plane.utils.porters.serializers.issue import IssueExportSerializer
 
@@ -197,7 +198,16 @@ def issue_export_task(
 
         # Create exporter for the specified format
         try:
-            exporter = DataExporter(IssueExportSerializer, format_type=provider)
+            redacted_project_ids = get_issue_chat_progress_redacted_project_ids(
+                exporter_instance.initiated_by,
+                slug,
+                project_ids,
+            )
+            exporter = DataExporter(
+                IssueExportSerializer,
+                format_type=provider,
+                context={"redact_chat_progress_project_ids": redacted_project_ids},
+            )
         except ValueError as e:
             # Invalid format type
             exporter_instance = ExporterHistory.objects.get(token=token_id)

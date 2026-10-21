@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from django.db.models import F, QuerySet
 
 from plane.db.models import CycleIssue, FileAsset
+from plane.utils.issue_chat import redacted_issue_description_stripped
 
 from .base import (
     DateField,
@@ -94,7 +95,7 @@ class IssueExportSchema(ExportSchema):
     project_id = StringField(source="project.id", label="Project ID")
     sequence_id = NumberField(source="sequence_id", label="Sequence ID")
     name = StringField(source="name", label="Name")
-    description = StringField(source="description_stripped", label="Description")
+    description = StringField(label="Description")
     priority = StringField(source="priority", label="Priority")
     start_date = DateField(source="start_date", label="Start Date")
     target_date = DateField(source="target_date", label="Target Date")
@@ -124,6 +125,11 @@ class IssueExportSchema(ExportSchema):
 
     def prepare_state_name(self, i):
         return i.state.name if i.state else None
+
+    def prepare_description(self, i):
+        if str(i.project_id) in self.context.get("redact_chat_progress_project_ids", set()):
+            return redacted_issue_description_stripped(i.description_html, i.description_stripped)
+        return i.description_stripped or ""
 
     def prepare_module_name(self, i):
         return [m.module.name for m in i.issue_module.all()]

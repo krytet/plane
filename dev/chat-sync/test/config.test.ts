@@ -91,6 +91,21 @@ test("normalizes provider URLs with uppercase hosts, trailing dots, and the defa
   assert.equal(normalizeProviderUrl("HTTPS://CHATGPT.COM.:443"), "https://chatgpt.com/");
 });
 
+test("normalizes UUID thread, project, and issue identifiers", async (t) => {
+  const value = baseConfig();
+  value.threads[0]!.threadId = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE";
+  value.threads[0]!.projectId = "00000000-0000-4000-8000-00000000000A";
+  value.threads[0]!.issueId = "00000000-0000-4000-8000-00000000000B";
+  const file = await configFile(value);
+  t.after(() => rm(file.directory, { recursive: true, force: true }));
+
+  const config = await loadConfig(file.path);
+
+  assert.equal(config.threads[0]!.threadId, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+  assert.equal(config.threads[0]!.projectId, "00000000-0000-4000-8000-00000000000a");
+  assert.equal(config.threads[0]!.issueId, "00000000-0000-4000-8000-00000000000b");
+});
+
 test("rejects non-provider and non-canonical provider URLs", async (t) => {
   const urls = [
     "http://chatgpt.com/codex/tasks/example",

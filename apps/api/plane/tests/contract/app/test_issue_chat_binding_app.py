@@ -13,6 +13,7 @@ from rest_framework.test import APIClient
 from plane.db.models import (
     APIToken,
     Issue,
+    IssueActivity,
     IssueChatBinding,
     IssueLink,
     Project,
@@ -404,3 +405,200 @@ def test_stale_issue_description_patch_keeps_manual_text_and_latest_generated_bl
     assert "Latest concurrent work" in issue.description_html
     assert "Spoofed generated text" not in issue.description_html
     assert issue.description_html.count('data-node-type="chat-progress"') == 1
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_issue_put_denies_a_foreign_user(tenant):
+    outsider = _user("put-outsider")
+    WorkspaceMember.objects.create(workspace=tenant["workspace"], member=outsider, role=15)
+    client = APIClient()
+    client.force_login(outsider)
+
+    response = client.put(
+        _issue_url(tenant["workspace"], tenant["issue"]),
+        {"name": "Hijacked", "description_html": "<p>Hijacked.</p>"},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    tenant["issue"].refresh_from_db()
+    assert tenant["issue"].name == "Chat progress"
+    assert "Hijacked" not in tenant["issue"].description_html
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_issue_put_keeps_manual_text_and_latest_generated_block(tenant):
+    issue = tenant["issue"]
+    payload = _payload(cursor=1)
+    first = tenant["client"].post(_url(tenant["workspace"], issue), payload, format="json")
+    assert first.status_code == status.HTTP_201_CREATED, first.content
+
+    issue.refresh_from_db()
+    stale_editor_html = issue.description_html.replace("Focused tests", "Spoofed generated text").replace(
+        "Keep this.",
+        "Keep this manual PUT edit.",
+    )
+    second = tenant["client"].post(
+        _url(tenant["workspace"], issue),
+        {**payload, "cursor": 2, "progress": {**payload["progress"], "now": ["Latest PUT work"]}},
+        format="json",
+    )
+    assert second.status_code == status.HTTP_200_OK, second.content
+
+    with (
+        mock.patch("plane.app.views.issue.base.issue_activity.delay"),
+        mock.patch("plane.app.views.issue.base.model_activity.delay"),
+        mock.patch("plane.app.views.issue.base.issue_description_version_task.delay"),
+    ):
+        response = tenant["client"].put(
+            _issue_url(tenant["workspace"], issue),
+            {"description_html": stale_editor_html},
+            format="json",
+        )
+
+    assert response.status_code == status.HTTP_200_OK, response.content
+    issue.refresh_from_db()
+    assert "Keep this manual PUT edit." in issue.description_html
+    assert "Latest PUT work" in issue.description_html
+    assert "Spoofed generated text" not in issue.description_html
+    assert issue.description_html.count('data-node-type="chat-progress"') == 1
+    assert response.data["name"] == issue.name
+    assert response.data["description_html"] == issue.description_html
+    assert response.data["description_stripped"] == issue.description_stripped
+    assert "description_json" in response.data
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_issue_put_rejects_a_manual_edit_to_generated_progress(tenant):
+    issue = tenant["issue"]
+    payload = _payload(cursor=1)
+    first = tenant["client"].post(_url(tenant["workspace"], issue), payload, format="json")
+    assert first.status_code == status.HTTP_201_CREATED, first.content
+
+    issue.refresh_from_db()
+    edited_html = issue.description_html.replace("Focused tests", "Edited through PUT")
+    Issue.all_objects.filter(pk=issue.pk).update(description_html=edited_html)
+
+    with (
+        mock.patch("plane.app.views.issue.base.issue_activity.delay"),
+        mock.patch("plane.app.views.issue.base.model_activity.delay"),
+        mock.patch("plane.app.views.issue.base.issue_description_version_task.delay"),
+    ):
+        response = tenant["client"].put(
+            _issue_url(tenant["workspace"], issue),
+            {"description_html": edited_html},
+            format="json",
+        )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.data["code"] == "manual_edit"
+    issue.refresh_from_db()
+    assert issue.description_html == edited_html
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_guest_issue_description_redacts_generated_progress(tenant):
+    issue = tenant["issue"]
+    first = tenant["client"].post(_url(tenant["workspace"], issue), _payload(cursor=1), format="json")
+    assert first.status_code == status.HTTP_201_CREATED, first.content
+
+    with mock.patch("plane.app.views.issue.base.recent_visited_task.delay"):
+        owner_view = tenant["client"].get(_issue_url(tenant["workspace"], issue))
+    assert owner_view.status_code == status.HTTP_200_OK
+    assert "Backend model" in owner_view.data["description_html"]
+
+    tenant["project"].guest_view_all_features = True
+    tenant["project"].save(update_fields=["guest_view_all_features"])
+    guest = _user("description-guest")
+    WorkspaceMember.objects.create(workspace=tenant["workspace"], member=guest, role=5)
+    ProjectMember.objects.create(project=tenant["project"], workspace=tenant["workspace"], member=guest, role=5)
+    guest_client = APIClient()
+    guest_client.force_login(guest)
+
+    with mock.patch("plane.app.views.issue.base.recent_visited_task.delay"):
+        guest_view = guest_client.get(_issue_url(tenant["workspace"], issue))
+
+    assert guest_view.status_code == status.HTTP_200_OK
+    assert "Manual description." in guest_view.data["description_html"]
+    assert "Backend model" not in guest_view.data["description_html"]
+    assert "Focused tests" not in guest_view.data["description_html"]
+    assert "chat-progress" not in guest_view.data["description_html"]
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_guest_paginated_feed_redacts_generated_progress(tenant):
+    issue = tenant["issue"]
+    synced = tenant["client"].post(_url(tenant["workspace"], issue), _payload(cursor=1), format="json")
+    assert synced.status_code == status.HTTP_201_CREATED, synced.content
+
+    feed_url = f"/api/workspaces/{tenant['workspace'].slug}/projects/{issue.project_id}/v2/issues/"
+    owner_feed = tenant["client"].get(feed_url, {"description": "true"})
+    assert owner_feed.status_code == status.HTTP_200_OK, owner_feed.content
+    owner_html = str(owner_feed.data["results"][0]["description_html"])
+    assert "Backend model" in owner_html
+    assert 'data-node-type="chat-progress"' in owner_html
+
+    tenant["project"].guest_view_all_features = True
+    tenant["project"].save(update_fields=["guest_view_all_features"])
+    guest = _user("feed-guest")
+    WorkspaceMember.objects.create(workspace=tenant["workspace"], member=guest, role=5)
+    ProjectMember.objects.create(project=tenant["project"], workspace=tenant["workspace"], member=guest, role=5)
+    guest_client = APIClient()
+    guest_client.force_login(guest)
+
+    guest_feed = guest_client.get(feed_url, {"description": "true"})
+
+    assert guest_feed.status_code == status.HTTP_200_OK, guest_feed.content
+    guest_html = str(guest_feed.data["results"][0]["description_html"])
+    assert "Manual description." in guest_html
+    assert "Backend model" not in guest_html
+    assert "Focused tests" not in guest_html
+    assert "chat-progress" not in guest_html
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_guest_history_redacts_generated_progress_values_and_issue_detail(tenant):
+    issue = tenant["issue"]
+    synced = tenant["client"].post(_url(tenant["workspace"], issue), _payload(cursor=1), format="json")
+    assert synced.status_code == status.HTTP_201_CREATED, synced.content
+    issue.refresh_from_db()
+    IssueActivity.objects.create(
+        issue=issue,
+        project=tenant["project"],
+        workspace=tenant["workspace"],
+        actor=tenant["owner"],
+        verb="updated",
+        field="description",
+        old_value="<p>Manual description.</p>",
+        new_value=issue.description_html,
+    )
+
+    history_url = f"/api/workspaces/{tenant['workspace'].slug}/projects/{issue.project_id}/issues/{issue.id}/history/"
+    owner_history = tenant["client"].get(history_url)
+    assert owner_history.status_code == status.HTTP_200_OK, owner_history.content
+    owner_activity = next(row for row in owner_history.data if row["field"] == "description")
+    assert "Backend model" in owner_activity["new_value"]
+
+    tenant["project"].guest_view_all_features = True
+    tenant["project"].save(update_fields=["guest_view_all_features"])
+    guest = _user("history-guest")
+    WorkspaceMember.objects.create(workspace=tenant["workspace"], member=guest, role=5)
+    ProjectMember.objects.create(project=tenant["project"], workspace=tenant["workspace"], member=guest, role=5)
+    guest_client = APIClient()
+    guest_client.force_login(guest)
+
+    guest_history = guest_client.get(history_url)
+
+    assert guest_history.status_code == status.HTTP_200_OK, guest_history.content
+    guest_activity = next(row for row in guest_history.data if row["field"] == "description")
+    serialized = str(guest_history.data)
+    assert "Manual description." in guest_activity["new_value"]
+    assert "Backend model" not in serialized
+    assert "Focused tests" not in serialized
+    assert "chat-progress" not in serialized

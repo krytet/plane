@@ -1,4 +1,4 @@
-import type { ThreadTarget } from "./config.ts";
+import { normalizeUuid, type ThreadTarget } from "./config.ts";
 import { ChatSyncError } from "./errors.ts";
 import type { PlanePayload } from "./state.ts";
 import type { Progress } from "./status-block.ts";
@@ -71,7 +71,7 @@ function parseBinding(value: unknown): PlaneBinding {
   return {
     id: value.id,
     provider: value.provider,
-    thread_id: value.thread_id,
+    thread_id: normalizeUuid(value.thread_id),
     sync_cursor: value.sync_cursor as number,
     progress: parseProgress(value.progress),
     link,
@@ -100,8 +100,8 @@ export class PlaneClient {
     const path = joinPath(
       this.baseUrl.pathname,
       `/api/v1/workspaces/${encodeURIComponent(target.workspaceSlug)}` +
-        `/projects/${encodeURIComponent(target.projectId)}` +
-        `/work-items/${encodeURIComponent(target.issueId)}/chat-bindings/`
+        `/projects/${encodeURIComponent(normalizeUuid(target.projectId))}` +
+        `/work-items/${encodeURIComponent(normalizeUuid(target.issueId))}/chat-bindings/`
     );
     return new URL(path, this.baseUrl.origin).toString();
   }
@@ -112,6 +112,7 @@ export class PlaneClient {
     try {
       return await this.fetchImpl(url, {
         ...init,
+        redirect: "error",
         signal: controller.signal,
         headers: {
           Accept: "application/json",
@@ -180,7 +181,7 @@ export class PlaneClient {
         const binding = parseBinding(body);
         if (
           binding.provider !== payload.provider ||
-          binding.thread_id !== payload.thread_id ||
+          binding.thread_id !== normalizeUuid(payload.thread_id) ||
           binding.sync_cursor !== payload.cursor
         ) {
           return { kind: "uncertain", status: response.status };

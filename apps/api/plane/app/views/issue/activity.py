@@ -20,6 +20,7 @@ from .relation import issue_in_project
 from plane.app.serializers import IssueActivitySerializer, IssueCommentSerializer
 from plane.app.permissions import ProjectEntityPermission, allow_permission, ROLE
 from plane.db.models import IssueActivity, IssueComment, CommentReaction, IntakeIssue
+from plane.utils.issue_chat import can_view_issue_chat_progress
 
 
 class IssueActivityEndpoint(BaseAPIView):
@@ -37,6 +38,13 @@ class IssueActivityEndpoint(BaseAPIView):
         # rows below are keyed by it. Archived and intake issues keep their history.
         if not issue_in_project(issue_id, slug, project_id, include_archived=True):
             return Response({"error": "Issue not found"}, status=status.HTTP_404_NOT_FOUND)
+        activity_context = {
+            "can_view_chat_progress": can_view_issue_chat_progress(
+                request.user,
+                slug,
+                project_id,
+            )
+        }
 
         issue_activities = (
             IssueActivity.objects.filter(issue_id=issue_id)
@@ -77,7 +85,11 @@ class IssueActivityEndpoint(BaseAPIView):
                     to_attr="source_data",
                 )
             )
-            issue_activities = IssueActivitySerializer(issue_activities, many=True).data
+            issue_activities = IssueActivitySerializer(
+                issue_activities,
+                many=True,
+                context=activity_context,
+            ).data
             return Response(issue_activities, status=status.HTTP_200_OK)
 
         if request.GET.get("activity_type", None) == "issue-comment":
@@ -86,7 +98,11 @@ class IssueActivityEndpoint(BaseAPIView):
 
         result_list = sorted(
             chain(
-                IssueActivitySerializer(issue_activities, many=True).data,
+                IssueActivitySerializer(
+                    issue_activities,
+                    many=True,
+                    context=activity_context,
+                ).data,
                 IssueCommentSerializer(issue_comments, many=True).data,
             ),
             key=lambda instance: instance["created_at"],

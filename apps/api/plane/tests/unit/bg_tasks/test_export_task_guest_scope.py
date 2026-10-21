@@ -13,6 +13,8 @@ import pytest
 
 from plane.bgtasks.export_task import issue_export_task
 from plane.db.models import ExporterHistory, Issue, Project, ProjectMember, User, WorkspaceMember
+from plane.utils.issue_chat import progress_block_id, render_progress_block
+from plane.utils.exporters.schemas.issue import IssueExportSchema
 
 pytestmark = pytest.mark.unit
 
@@ -42,7 +44,7 @@ def _make_issue(name, project, author):
     return issue
 
 
-def _exported_names(workspace, project, user):
+def _exported_rows(workspace, project, user):
     exporter = ExporterHistory.objects.create(
         workspace=workspace, project=[project.id], initiated_by=user, provider="json", type="issue_exports"
     )
@@ -57,7 +59,11 @@ def _exported_names(workspace, project, user):
         )
     assert upload.called, ExporterHistory.objects.get(pk=exporter.pk).reason
     with zipfile.ZipFile(upload.call_args.args[0]) as zf:
-        return {row["name"] for f in zf.namelist() for row in json.loads(zf.read(f))}
+        return [row for f in zf.namelist() for row in json.loads(zf.read(f))]
+
+
+def _exported_names(workspace, project, user):
+    return {row["name"] for row in _exported_rows(workspace, project, user)}
 
 
 @pytest.mark.django_db
@@ -78,3 +84,50 @@ def test_export_respects_guest_scope(
     _make_issue("other", project, create_user)
 
     assert _exported_names(workspace, project, user) == expected
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("project_role, expected_managed_text", [(5, False), (15, True)])
+def test_export_redacts_generated_description_for_project_guests(
+    workspace,
+    project,
+    make_member,
+    project_role,
+    expected_managed_text,
+):
+    Project.objects.filter(pk=project.pk).update(guest_view_all_features=True)
+    user = make_member(project_role)
+    issue = _make_issue("described", project, user)
+    binding_id = uuid4()
+    block = render_progress_block(
+        binding_id,
+        {"done": ["Managed completion"], "now": ["Managed current work"], "waiting": []},
+    )
+    issue.description_html = f"<p>Manual export description.</p>{block}"
+    issue.save()
+
+    rows = _exported_rows(workspace, project, user)
+
+    assert len(rows) == 1
+    assert "Manual export description." in rows[0]["description"]
+    assert ('id="' + progress_block_id(binding_id) + '"') not in rows[0]["description"]
+    assert ("Managed completion" in rows[0]["description"]) is expected_managed_text
+
+
+@pytest.mark.django_db
+def test_issue_export_schema_redacts_only_restricted_projects(workspace, project, create_user):
+    issue = _make_issue("schema-described", project, create_user)
+    block = render_progress_block(
+        uuid4(),
+        {"done": ["Schema completion"], "now": [], "waiting": []},
+    )
+    issue.description_html = f"<p>Manual schema description.</p>{block}"
+    issue.save()
+
+    restricted = IssueExportSchema(
+        context={"redact_chat_progress_project_ids": {str(project.id)}}
+    ).serialize(issue)
+    privileged = IssueExportSchema(context={"redact_chat_progress_project_ids": set()}).serialize(issue)
+
+    assert restricted["description"] == "Manual schema description."
+    assert "Schema completion" in privileged["description"]

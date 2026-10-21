@@ -38,6 +38,7 @@ from plane.utils.grouper import (
     issue_queryset_grouper,
 )
 from plane.utils.issue_filters import issue_filters
+from plane.utils.issue_chat import can_view_issue_chat_progress
 from plane.utils.order_queryset import order_issue_queryset
 from plane.utils.paginator import GroupedOffsetPaginator, SubGroupedOffsetPaginator
 from plane.app.permissions import allow_permission, ROLE
@@ -250,7 +251,17 @@ class IssueArchiveViewSet(BaseViewSet):
                 {"error": "The required object does not exist."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        serializer = IssueDetailSerializer(issue, expand=self.expand)
+        serializer = IssueDetailSerializer(
+            issue,
+            expand=self.expand,
+            context={
+                "can_view_chat_progress": can_view_issue_chat_progress(
+                    request.user,
+                    slug,
+                    project_id,
+                )
+            },
+        )
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER])

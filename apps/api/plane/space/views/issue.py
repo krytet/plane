@@ -68,6 +68,7 @@ from plane.db.models import (
 )
 from plane.bgtasks.issue_activities_task import issue_activity
 from plane.utils.issue_filters import issue_filters
+from plane.utils.issue_chat import redact_issue_description_fields
 
 
 # Public Spaces board writes must bind caller-supplied object ids to the board's
@@ -862,4 +863,6 @@ class IssueRetrievePublicEndpoint(BaseAPIView):
             )
         ).first()
 
+        if issue_queryset is not None:
+            redact_issue_description_fields(issue_queryset)
         return Response(issue_queryset, status=status.HTTP_200_OK)

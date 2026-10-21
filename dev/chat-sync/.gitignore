@@ -1,4 +1,5 @@
 config.local.json
 state/
+.state/
 *.tmp
 *.lock

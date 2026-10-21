@@ -30,7 +30,9 @@ from plane.db.models import (
     CommentReaction,
     DeployBoard,
     Intake,
+    IntakeIssue,
     Issue,
+    IssueChatBinding,
     IssueComment,
     IssueReaction,
     Project,
@@ -40,6 +42,7 @@ from plane.db.models import (
     Workspace,
     WorkspaceMember,
 )
+from plane.utils.issue_chat import progress_block_hash, progress_block_id, render_progress_block
 
 
 # --------------------------------------------------------------------------- #
@@ -659,3 +662,116 @@ class TestSpacesBoardCommentWritableFields:
         assert comment.actor_id == create_user.id
         assert comment.access == "EXTERNAL"
         assert comment.parent_id is None
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_public_issue_detail_redacts_managed_chat_progress(board):
+    issue = board["issue"]
+    binding = IssueChatBinding.objects.create(
+        workspace=board["project"].workspace,
+        project=board["project"],
+        issue=issue,
+        provider="codex",
+        thread_id=f"public-{uuid4().hex}",
+        progress={"done": ["private completion"], "now": ["private work"], "waiting": ["private wait"]},
+    )
+    block = render_progress_block(binding.id, binding.progress)
+    issue.description_html = f"<p>Public manual description.</p>{block}"
+    issue.description_stripped = "Public manual description. private completion private work private wait"
+    issue.description_json = {
+        "type": "doc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Public manual description."}]},
+            {
+                "type": "chat-progress",
+                "attrs": {"id": progress_block_id(binding.id), "progress": binding.progress},
+            },
+        ],
+    }
+    issue.save(update_fields=["description_html", "description_stripped", "description_json"])
+
+    response = APIClient().get(f"/api/public/anchor/{board['anchor']}/issues/{issue.id}/")
+
+    assert response.status_code == status.HTTP_200_OK, response.content
+    serialized = json.dumps(response.data, default=str)
+    assert "Public manual description." in response.data["description_html"]
+    assert "private completion" not in serialized
+    assert "private work" not in serialized
+    assert "private wait" not in serialized
+    assert "chat-progress" not in serialized
+    assert response.data["description_binary"] is None
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_public_intake_edit_preserves_latest_managed_chat_progress(board, workspace):
+    issue = board["issue"]
+    binding = IssueChatBinding.objects.create(
+        workspace=workspace,
+        project=board["project"],
+        issue=issue,
+        provider="codex",
+        thread_id=f"intake-{uuid4().hex}",
+        progress={"done": ["trusted completion"], "now": ["trusted current work"], "waiting": []},
+    )
+    block = render_progress_block(binding.id, binding.progress)
+    issue.description_html = f"<p>Original intake text.</p>{block}"
+    issue.description_json = {
+        "type": "doc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Original intake text."}]},
+            {
+                "type": "chatProgress",
+                "attrs": {"id": progress_block_id(binding.id), "progress": binding.progress},
+            },
+        ],
+    }
+    issue.save(update_fields=["description_html", "description_json"])
+    IssueChatBinding.objects.filter(pk=binding.pk).update(generated_block_hash=progress_block_hash(block))
+
+    submitter = User.objects.create(
+        email=f"intake-submitter-{uuid4().hex[:8]}@plane.so",
+        username=f"intake_submitter_{uuid4().hex[:8]}",
+    )
+    intake_issue = IntakeIssue.objects.create(
+        intake=board["intake"],
+        issue=issue,
+        project=board["project"],
+        created_by=submitter,
+    )
+    IntakeIssue.objects.filter(pk=intake_issue.pk).update(created_by=submitter)
+    client = APIClient()
+    client.force_login(submitter)
+
+    response = client.patch(
+        f"/api/public/anchor/{board['anchor']}/intakes/{board['intake'].id}/intake-issues/{intake_issue.id}/",
+        {
+            "issue": {
+                "name": "Edited public intake",
+                "description_html": "<p>Edited public intake text.</p>",
+                "description_json": {
+                    "type": "doc",
+                    "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "Edited public intake text."}]}
+                    ],
+                },
+            }
+        },
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK, response.content
+    issue.refresh_from_db()
+    assert "Edited public intake text." in issue.description_html
+    assert "trusted current work" in issue.description_html
+    assert issue.description_html.count('data-node-type="chat-progress"') == 1
+    json_nodes = [
+        node
+        for node in issue.description_json.get("content", [])
+        if node.get("type") == "chatProgress"
+    ]
+    assert len(json_nodes) == 1
+    assert json_nodes[0]["attrs"]["id"] == progress_block_id(binding.id)
+    assert json_nodes[0]["attrs"]["progress"]["now"] == ["trusted current work"]
+    assert "trusted current work" not in json.dumps(response.data, default=str)

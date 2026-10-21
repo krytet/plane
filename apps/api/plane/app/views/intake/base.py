@@ -7,6 +7,7 @@ import json
 
 # Django import
 from django.utils import timezone
+from django.db import transaction
 from django.db.models import Q, Count, OuterRef, Func, F, Prefetch, Subquery
 from django.core.serializers.json import DjangoJSONEncoder
 from django.contrib.postgres.aggregates import ArrayAgg
@@ -44,6 +45,13 @@ from plane.app.serializers import (
     IssueDescriptionVersionDetailSerializer,
 )
 from plane.utils.issue_filters import issue_filters
+from plane.utils.issue_chat import (
+    IssueChatConflict,
+    can_view_issue_chat_progress,
+    merge_latest_chat_description,
+    redact_chat_progress_html,
+    redact_chat_progress_json,
+)
 from plane.utils.order_queryset import INTAKE_ISSUE_ORDER_BY_ALLOWLIST, sanitize_order_by
 from plane.bgtasks.issue_activities_task import issue_activity
 from plane.bgtasks.issue_description_version_task import issue_description_version_task
@@ -327,7 +335,16 @@ class IntakeIssueViewSet(BaseViewSet):
                     project_id=project_id,
                 )
             )
-            serializer = IntakeIssueDetailSerializer(intake_issue)
+            serializer = IntakeIssueDetailSerializer(
+                intake_issue,
+                context={
+                    "can_view_chat_progress": can_view_issue_chat_progress(
+                        request.user,
+                        slug,
+                        project_id,
+                    )
+                },
+            )
             return Response(serializer.data, status=status.HTTP_200_OK)
         else:
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -405,8 +422,12 @@ class IntakeIssueViewSet(BaseViewSet):
             if project_member and project_member.role <= ROLE.GUEST.value:
                 issue_data = {
                     "name": issue_data.get("name", issue.name),
-                    "description_html": issue_data.get("description_html", issue.description_html),
-                    "description_json": issue_data.get("description_json", issue.description_json),
+                    "description_html": redact_chat_progress_html(
+                        issue_data.get("description_html", issue.description_html)
+                    ),
+                    "description_json": redact_chat_progress_json(
+                        issue_data.get("description_json", issue.description_json)
+                    ),
                 }
 
             issue_current_instance = json.dumps(IssueDetailSerializer(issue).data, cls=DjangoJSONEncoder)
@@ -433,7 +454,37 @@ class IntakeIssueViewSet(BaseViewSet):
 
         # Both serializers are valid, now save them
         if issue_serializer:
-            issue_serializer.save()
+            try:
+                with transaction.atomic():
+                    issue = (
+                        Issue.objects.select_for_update(of=("self",))
+                        .filter(workspace__slug=slug, project_id=project_id, pk=intake_issue.issue_id)
+                        .first()
+                    )
+                    if issue is None:
+                        return Response({"error": "Work item not found"}, status=status.HTTP_404_NOT_FOUND)
+                    issue_current_instance = json.dumps(IssueDetailSerializer(issue).data, cls=DjangoJSONEncoder)
+                    if "description_html" in issue_serializer.validated_data:
+                        merged_description, merged_description_json = merge_latest_chat_description(
+                            issue,
+                            issue_serializer.validated_data["description_html"],
+                            issue_serializer.validated_data.get("description_json"),
+                        )
+                        issue_serializer.instance = issue
+                        issue_serializer.validated_data["description_html"] = merged_description
+                        if merged_description_json is not None:
+                            issue_serializer.validated_data["description_json"] = merged_description_json
+                        requested_data = json.loads(issue_requested_data)
+                        requested_data["description_html"] = merged_description
+                        if merged_description_json is not None:
+                            requested_data["description_json"] = merged_description_json
+                        issue_requested_data = json.dumps(requested_data, cls=DjangoJSONEncoder)
+                    issue_serializer.save()
+            except IssueChatConflict as exc:
+                return Response(
+                    {"error": exc.message, "code": exc.code},
+                    status=status.HTTP_409_CONFLICT,
+                )
 
             # Check if the update is a migration description update
             is_migration_description_update = skip_activity and is_description_update
@@ -501,7 +552,16 @@ class IntakeIssueViewSet(BaseViewSet):
             )
             .get(intake_id=intake_id.id, issue_id=pk, project_id=project_id)
         )
-        serializer = IntakeIssueDetailSerializer(intake_issue).data
+        serializer = IntakeIssueDetailSerializer(
+            intake_issue,
+            context={
+                "can_view_chat_progress": can_view_issue_chat_progress(
+                    request.user,
+                    slug,
+                    project_id,
+                )
+            },
+        ).data
         return Response(serializer, status=status.HTTP_200_OK)
 
     @allow_permission(allowed_roles=[ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], creator=True, model=Issue)
@@ -548,7 +608,16 @@ class IntakeIssueViewSet(BaseViewSet):
                 {"error": "You are not allowed to view this issue"},
                 status=status.HTTP_403_FORBIDDEN,
             )
-        issue = IntakeIssueDetailSerializer(intake_issue).data
+        issue = IntakeIssueDetailSerializer(
+            intake_issue,
+            context={
+                "can_view_chat_progress": can_view_issue_chat_progress(
+                    request.user,
+                    slug,
+                    project_id,
+                )
+            },
+        ).data
         return Response(issue, status=status.HTTP_200_OK)
 
     @allow_permission(allowed_roles=[ROLE.ADMIN], creator=True, model=Issue)
@@ -609,7 +678,16 @@ class IntakeWorkItemDescriptionVersionEndpoint(BaseAPIView):
                 pk=pk,
             )
 
-            serializer = IssueDescriptionVersionDetailSerializer(issue_description_version)
+            serializer = IssueDescriptionVersionDetailSerializer(
+                issue_description_version,
+                context={
+                    "can_view_chat_progress": can_view_issue_chat_progress(
+                        request.user,
+                        slug,
+                        project_id,
+                    )
+                },
+            )
             return Response(serializer.data, status=status.HTTP_200_OK)
 
         cursor = request.GET.get("cursor", None)

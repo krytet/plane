@@ -5,6 +5,7 @@
 import hashlib
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from html import escape
 from urllib.parse import urlsplit, urlunsplit
@@ -17,10 +18,12 @@ from django.core.validators import URLValidator
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from plane.db.models import Issue, IssueChatBinding, IssueLink
+from plane.db.models import Issue, IssueChatBinding, IssueLink, ProjectMember, WorkspaceMember
+from plane.db.models.project import ROLE
 
 
 PROGRESS_BLOCK_TYPE = "chat-progress"
+CHAT_PROGRESS_JSON_TYPE = "chatProgress"
 PROGRESS_BLOCK_ID_PREFIX = "plane-chat-progress-"
 PROGRESS_KEYS = ("done", "now", "waiting")
 CODEX_NATIVE_URL_PREFIX = "codex://threads/"
@@ -78,6 +81,22 @@ class IssueChatSyncResult:
     binding: IssueChatBinding
     created: bool
     applied: bool
+
+
+_DROP_CHAT_PROGRESS = object()
+
+
+def _attribute_text(value):
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _is_chat_progress_identity(node_type, marker_id):
+    normalized_type = _WHITESPACE_RE.sub("-", str(node_type or "").strip()).lower()
+    if normalized_type.replace("_", "-").replace("-", "") == "chatprogress":
+        return True
+    return _attribute_text(marker_id).lower().startswith(PROGRESS_BLOCK_ID_PREFIX)
 
 
 def progress_block_id(binding_id):
@@ -296,7 +315,110 @@ def merge_progress_block(description_html, binding_id, progress, expected_block_
     return updated_description, progress_block_hash(rendered_block)
 
 
-def merge_latest_chat_blocks(issue, submitted_description_html):
+def _chat_progress_json_node_id(node):
+    attrs = node.get("attrs")
+    attrs = attrs if isinstance(attrs, dict) else {}
+    node_type = node.get("type") or node.get("name") or attrs.get("data-node-type") or attrs.get("dataNodeType")
+    marker_id = node.get("id") or attrs.get("id")
+    if not _is_chat_progress_identity(node_type, marker_id):
+        return None
+    return _attribute_text(marker_id)
+
+
+def _collect_chat_progress_json_nodes(value, nodes):
+    if isinstance(value, list):
+        for item in value:
+            _collect_chat_progress_json_nodes(item, nodes)
+        return
+    if not isinstance(value, dict):
+        return
+
+    marker_id = _chat_progress_json_node_id(value)
+    if marker_id is not None:
+        if not marker_id:
+            raise IssueChatProgressConflict(
+                "malformed_block",
+                "The generated progress block is malformed.",
+            )
+        if marker_id in nodes:
+            raise IssueChatProgressConflict(
+                "duplicate_block",
+                "The generated progress block appears more than once.",
+            )
+        nodes[marker_id] = deepcopy(value)
+        return
+
+    for item in value.values():
+        _collect_chat_progress_json_nodes(item, nodes)
+
+
+def _latest_chat_progress_json_node(marker_id, binding, current_nodes):
+    node = deepcopy(current_nodes.get(marker_id, {}))
+    attrs = node.get("attrs")
+    attrs = deepcopy(attrs) if isinstance(attrs, dict) else {}
+    attrs["id"] = marker_id
+    attrs["progress"] = normalize_progress(binding.progress)
+    node.setdefault("type", CHAT_PROGRESS_JSON_TYPE)
+    node["attrs"] = attrs
+    return node
+
+
+def _merge_chat_progress_json_value(value, latest_blocks, seen_markers):
+    if isinstance(value, list):
+        merged = []
+        for item in value:
+            replaced = _merge_chat_progress_json_value(item, latest_blocks, seen_markers)
+            if replaced is not _DROP_CHAT_PROGRESS:
+                merged.append(replaced)
+        return merged
+    if not isinstance(value, dict):
+        return value
+
+    marker_id = _chat_progress_json_node_id(value)
+    if marker_id is not None:
+        if not marker_id:
+            raise IssueChatProgressConflict(
+                "malformed_block",
+                "The generated progress block is malformed.",
+            )
+        if marker_id in seen_markers:
+            raise IssueChatProgressConflict(
+                "duplicate_block",
+                "The generated progress block appears more than once.",
+            )
+        if marker_id not in latest_blocks:
+            raise IssueChatProgressConflict(
+                "unknown_block",
+                "The description contains a generated progress block that does not belong to this work item.",
+            )
+        seen_markers.add(marker_id)
+        return deepcopy(latest_blocks[marker_id])
+
+    return {
+        key: merged
+        for key, item in value.items()
+        for merged in [_merge_chat_progress_json_value(item, latest_blocks, seen_markers)]
+        if merged is not _DROP_CHAT_PROGRESS
+    }
+
+
+def _append_chat_progress_json_nodes(description_json, nodes):
+    if not nodes:
+        return description_json
+    if isinstance(description_json, list):
+        return [*description_json, *[deepcopy(node) for node in nodes]]
+    if not isinstance(description_json, dict):
+        return {"type": "doc", "content": [deepcopy(node) for node in nodes]}
+
+    description_json = deepcopy(description_json)
+    content = description_json.get("content")
+    content = content if isinstance(content, list) else []
+    content.extend(deepcopy(node) for node in nodes)
+    description_json["content"] = content
+    return description_json
+
+
+def merge_latest_chat_description(issue, submitted_description_html, submitted_description_json=None):
     """Keep current server-generated blocks while applying a manual description edit.
 
     Callers must hold a row lock on ``issue``. Chat sync acquires the same lock
@@ -321,6 +443,15 @@ def merge_latest_chat_blocks(issue, submitted_description_html):
             )
         current_blocks[marker_id] = current_description[start:end]
     latest_blocks = {}
+    latest_json_blocks = {}
+    current_json_blocks = {}
+    if submitted_description_json is not None:
+        if not isinstance(submitted_description_json, (dict, list)):
+            raise IssueChatProgressConflict(
+                "malformed_json",
+                "The work item description JSON is malformed.",
+            )
+        _collect_chat_progress_json_nodes(issue.description_json, current_json_blocks)
 
     for binding in bindings:
         marker_id = progress_block_id(binding.id)
@@ -345,6 +476,12 @@ def merge_latest_chat_blocks(issue, submitted_description_html):
                 "The generated progress block was edited manually; refusing to update the description.",
             )
         latest_blocks[marker_id] = current_block
+        if submitted_description_json is not None:
+            latest_json_blocks[marker_id] = _latest_chat_progress_json_node(
+                marker_id,
+                binding,
+                current_json_blocks,
+            )
 
     submitted_description = submitted_description_html or "<p></p>"
     submitted_blocks = _generated_block_bounds(submitted_description)
@@ -364,15 +501,208 @@ def merge_latest_chat_blocks(issue, submitted_description_html):
 
     merged_description = submitted_description
     for start, end, marker_id in sorted(submitted_blocks, key=lambda match: match[0], reverse=True):
-        merged_description = (
-            f"{merged_description[:start]}{latest_blocks[marker_id]}{merged_description[end:]}"
-        )
+        merged_description = f"{merged_description[:start]}{latest_blocks[marker_id]}{merged_description[end:]}"
 
     for marker_id in latest_blocks:
         if marker_id not in seen_markers:
             merged_description = f"{merged_description}{latest_blocks[marker_id]}"
 
-    return merged_description
+    merged_description_json = None
+    if submitted_description_json is not None:
+        seen_json_markers = set()
+        merged_description_json = _merge_chat_progress_json_value(
+            submitted_description_json,
+            latest_json_blocks,
+            seen_json_markers,
+        )
+        merged_description_json = _append_chat_progress_json_nodes(
+            merged_description_json,
+            [
+                latest_json_blocks[marker_id]
+                for marker_id in latest_json_blocks
+                if marker_id not in seen_json_markers
+            ],
+        )
+
+    return merged_description, merged_description_json
+
+
+def merge_latest_chat_blocks(issue, submitted_description_html):
+    """HTML-only compatibility wrapper for description preservation."""
+
+    return merge_latest_chat_description(issue, submitted_description_html)[0]
+
+
+def can_view_issue_chat_progress(user, workspace_slug, project_id):
+    """Return whether a project member may see generated chat progress.
+
+    Guests are denied even when ``guest_view_all_features`` exposes the rest of
+    the work item. A workspace admin who is a project guest follows the same
+    rule as chat binding management and remains allowed.
+    """
+
+    if user is None or not getattr(user, "is_authenticated", False):
+        return False
+
+    role = (
+        ProjectMember.objects.filter(
+            workspace__slug=workspace_slug,
+            project_id=project_id,
+            member=user,
+            is_active=True,
+        )
+        .values_list("role", flat=True)
+        .first()
+    )
+    if role is None:
+        return False
+    if role >= ROLE.MEMBER.value:
+        return True
+    return WorkspaceMember.objects.filter(
+        workspace__slug=workspace_slug,
+        member=user,
+        role=ROLE.ADMIN.value,
+        is_active=True,
+    ).exists()
+
+
+def redact_chat_progress_html(description_html):
+    """Remove generated progress blocks while preserving manual HTML."""
+
+    if not description_html:
+        return description_html
+    soup = BeautifulSoup(description_html, "html.parser")
+    removed = False
+    for tag in list(soup.find_all("div")):
+        attributes = getattr(tag, "attrs", {})
+        if _is_chat_progress_identity(attributes.get("data-node-type"), attributes.get("id")):
+            tag.decompose()
+            removed = True
+    return str(soup) if removed else description_html
+
+
+def _redact_chat_progress_json_value(value):
+    if isinstance(value, list):
+        return [
+            redacted
+            for item in value
+            for redacted in [_redact_chat_progress_json_value(item)]
+            if redacted is not _DROP_CHAT_PROGRESS
+        ]
+    if not isinstance(value, dict):
+        return value
+
+    attrs = value.get("attrs")
+    attrs = attrs if isinstance(attrs, dict) else {}
+    if _is_chat_progress_identity(
+        value.get("type") or value.get("name") or attrs.get("data-node-type") or attrs.get("dataNodeType"),
+        value.get("id") or attrs.get("id"),
+    ):
+        return _DROP_CHAT_PROGRESS
+
+    return {
+        key: redacted
+        for key, item in value.items()
+        for redacted in [_redact_chat_progress_json_value(item)]
+        if redacted is not _DROP_CHAT_PROGRESS
+    }
+
+
+def redact_chat_progress_json(description_json):
+    if description_json is None:
+        return None
+    redacted = _redact_chat_progress_json_value(description_json)
+    return {} if redacted is _DROP_CHAT_PROGRESS else redacted
+
+
+def redact_issue_description_fields(data):
+    """Strip protected progress from every description representation."""
+
+    description_html = data.get("description_html")
+    redacted_html = redact_chat_progress_html(description_html)
+    if "description_html" in data:
+        data["description_html"] = redacted_html
+    if "description_stripped" in data:
+        data["description_stripped"] = redacted_issue_description_stripped(
+            description_html,
+            data.get("description_stripped"),
+        )
+    if "description_json" in data:
+        data["description_json"] = redact_chat_progress_json(data.get("description_json"))
+    if "description_binary" in data:
+        data["description_binary"] = None
+    return data
+
+
+def redacted_issue_description_stripped(description_html, description_stripped):
+    """Return plain text derived from redacted HTML when the HTML is available."""
+
+    redacted_html = redact_chat_progress_html(description_html)
+    if isinstance(redacted_html, str) and redacted_html != description_html:
+        return _WHITESPACE_RE.sub(" ", BeautifulSoup(redacted_html, "html.parser").get_text(" ", strip=True)).strip()
+    return description_stripped
+
+
+def redact_issue_activity_fields(data):
+    """Redact generated progress from description changes and nested issue detail."""
+
+    for key in ("old_value", "new_value"):
+        value = data.get(key)
+        if isinstance(value, str):
+            redacted = redact_chat_progress_html(value)
+            if redacted == value:
+                stripped = value.strip()
+                if stripped.startswith(("{", "[")):
+                    try:
+                        parsed = json.loads(stripped)
+                    except (TypeError, ValueError):
+                        pass
+                    else:
+                        redacted_json = redact_chat_progress_json(parsed)
+                        redacted = json.dumps(redacted_json, ensure_ascii=False)
+            data[key] = redacted
+        elif isinstance(value, (dict, list)):
+            data[key] = redact_chat_progress_json(value)
+
+    for key in ("issue", "issue_detail"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            redact_issue_description_fields(nested)
+    return data
+
+
+def get_issue_chat_progress_redacted_project_ids(user, workspace_slug, project_ids):
+    """Bulk scope progress redaction for exports without a query per work item."""
+
+    project_ids = {str(project_id) for project_id in project_ids}
+    if not project_ids:
+        return set()
+    if user is None or not getattr(user, "is_authenticated", False):
+        return project_ids
+
+    roles = {
+        str(project_id): role
+        for project_id, role in ProjectMember.objects.filter(
+            workspace__slug=workspace_slug,
+            project_id__in=project_ids,
+            member=user,
+            is_active=True,
+        ).values_list("project_id", "role")
+    }
+    is_workspace_admin = WorkspaceMember.objects.filter(
+        workspace__slug=workspace_slug,
+        member=user,
+        role=ROLE.ADMIN.value,
+        is_active=True,
+    ).exists()
+    return {
+        project_id
+        for project_id in project_ids
+        if not (
+            roles.get(project_id, -1) >= ROLE.MEMBER.value
+            or (is_workspace_admin and project_id in roles)
+        )
+    }
 
 
 def _issue_queryset(workspace_slug, project_id):
@@ -434,6 +764,8 @@ def sync_issue_chat_binding(
 
     normalized_progress = normalize_progress(progress)
     normalized_thread_id = (thread_id or "").strip()
+    if provider == IssueChatBinding.Provider.CODEX:
+        normalized_thread_id = normalize_codex_thread_id(normalized_thread_id) or normalized_thread_id
     requested_url = normalize_chat_binding_url(provider, normalized_thread_id, url)
     requested_title = _normalize_item(title) if title else None
     request_payload = {
