@@ -589,6 +589,7 @@ class IssueChatObservationSerializer(serializers.Serializer):
     state = serializers.ChoiceField(choices=IssueChatBinding.ObservationState.choices)
     observed_at = serializers.DateTimeField()
     turn_id = serializers.CharField(max_length=255, trim_whitespace=True)
+    resume_after_stop = serializers.BooleanField(required=False, default=False)
 
     def validate_turn_id(self, value):
         if not value:
@@ -596,13 +597,22 @@ class IssueChatObservationSerializer(serializers.Serializer):
         return value
 
     def validate(self, attrs):
-        unsupported = sorted(set(self.initial_data) - {"state", "observed_at", "turn_id"})
+        unsupported = sorted(
+            set(self.initial_data) - {"state", "observed_at", "turn_id", "resume_after_stop"}
+        )
         if unsupported:
             raise serializers.ValidationError(
                 {
                     field: "Only typed observation metadata is supported; chat text is not accepted."
                     for field in unsupported
                 }
+            )
+        if (
+            attrs.get("resume_after_stop")
+            and attrs["state"] != IssueChatBinding.ObservationState.RUNNING
+        ):
+            raise serializers.ValidationError(
+                {"resume_after_stop": "This flag is only valid for a running observation."}
             )
         return attrs
 

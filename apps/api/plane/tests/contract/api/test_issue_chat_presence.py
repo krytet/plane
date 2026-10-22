@@ -202,6 +202,104 @@ def test_completed_turn_cannot_return_to_running(tenant):
 
 @pytest.mark.contract
 @pytest.mark.django_db
+def test_answer_can_resume_same_turn_only_with_explicit_stop_resume_flag(tenant):
+    binding = _create_binding(tenant)
+    url = _observation_url(tenant["workspace"], tenant["issue"], binding)
+    observed_at = timezone.now()
+    completed = tenant["api_client"].post(
+        url,
+        {
+            "state": "answer_available",
+            "observed_at": observed_at.isoformat(),
+            "turn_id": "turn-resume",
+        },
+        format="json",
+    )
+    assert completed.status_code == status.HTTP_200_OK
+
+    implicit = tenant["api_client"].post(
+        url,
+        {
+            "state": "running",
+            "observed_at": (observed_at + timedelta(seconds=1)).isoformat(),
+            "turn_id": "turn-resume",
+        },
+        format="json",
+    )
+    assert implicit.status_code == status.HTTP_409_CONFLICT
+    assert implicit.data["code"] == "invalid_transition"
+
+    explicit = tenant["api_client"].post(
+        url,
+        {
+            "state": "running",
+            "observed_at": (observed_at + timedelta(seconds=2)).isoformat(),
+            "turn_id": "turn-resume",
+            "resume_after_stop": True,
+        },
+        format="json",
+    )
+    assert explicit.status_code == status.HTTP_200_OK
+    assert explicit.data["observation_state"] == "running"
+    binding.refresh_from_db()
+    assert binding.observation_state == "running"
+    assert binding.observation_turn_id == "turn-resume"
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_failed_turn_cannot_resume_with_stop_resume_flag(tenant):
+    binding = _create_binding(tenant)
+    url = _observation_url(tenant["workspace"], tenant["issue"], binding)
+    observed_at = timezone.now()
+    failed = tenant["api_client"].post(
+        url,
+        {
+            "state": "failed",
+            "observed_at": observed_at.isoformat(),
+            "turn_id": "turn-failed",
+        },
+        format="json",
+    )
+    assert failed.status_code == status.HTTP_200_OK
+
+    regression = tenant["api_client"].post(
+        url,
+        {
+            "state": "running",
+            "observed_at": (observed_at + timedelta(seconds=1)).isoformat(),
+            "turn_id": "turn-failed",
+            "resume_after_stop": True,
+        },
+        format="json",
+    )
+    assert regression.status_code == status.HTTP_409_CONFLICT
+    assert regression.data["code"] == "invalid_transition"
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_stop_resume_flag_is_rejected_for_non_running_observation(tenant):
+    binding = _create_binding(tenant)
+    response = tenant["api_client"].post(
+        _observation_url(tenant["workspace"], tenant["issue"], binding),
+        {
+            "state": "answer_available",
+            "observed_at": timezone.now().isoformat(),
+            "turn_id": "turn-invalid-flag",
+            "resume_after_stop": True,
+        },
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "resume_after_stop" in response.data
+    binding.refresh_from_db()
+    assert binding.observation_state == "unknown"
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
 def test_observation_requires_existing_codex_binding_and_never_accepts_chat_text(tenant):
     binding = _create_binding(tenant)
     url = _observation_url(tenant["workspace"], tenant["issue"], binding)

@@ -500,6 +500,15 @@ def _apply_llm_complete_state(
         ):
             raise LlmCompleteConflict("The final state update did not preserve the expected state or description.")
 
+        from plane.utils.issue_chat_workflow import record_verified_issue_chat_completion
+
+        record_verified_issue_chat_completion(
+            issue=issue,
+            state=state,
+            previous_state_id=previous_state_id,
+            verified_at=timezone.now(),
+        )
+
     return state, False, previous_state_id
 
 

@@ -492,6 +492,205 @@ class IssueChatBindingSeen(ProjectBaseModel):
         return f"{self.binding_id} seen by {self.member_id}"
 
 
+class IssueChatWorkflowPolicy(ProjectBaseModel):
+    source_state = models.ForeignKey(
+        "db.State",
+        on_delete=models.PROTECT,
+        related_name="issue_chat_workflow_source_policies",
+    )
+    running_state = models.ForeignKey(
+        "db.State",
+        on_delete=models.PROTECT,
+        related_name="issue_chat_workflow_running_policies",
+    )
+    attention_state = models.ForeignKey(
+        "db.State",
+        on_delete=models.PROTECT,
+        related_name="issue_chat_workflow_attention_policies",
+    )
+    manual_hold_state = models.ForeignKey(
+        "db.State",
+        on_delete=models.PROTECT,
+        related_name="issue_chat_workflow_manual_hold_policies",
+    )
+    todo_state = models.ForeignKey(
+        "db.State",
+        on_delete=models.PROTECT,
+        related_name="issue_chat_workflow_todo_policies",
+        null=True,
+        blank=True,
+    )
+    completion_state = models.ForeignKey(
+        "db.State",
+        on_delete=models.PROTECT,
+        related_name="issue_chat_workflow_completion_policies",
+    )
+    enabled = models.BooleanField(default=False)
+    version = models.PositiveBigIntegerField(default=1)
+    effective_at = models.DateTimeField(null=True, blank=True)
+    stale_running_ttl_seconds = models.PositiveIntegerField(default=3600)
+
+    class Meta:
+        verbose_name = "Issue Chat Workflow Policy"
+        verbose_name_plural = "Issue Chat Workflow Policies"
+        db_table = "issue_chat_workflow_policies"
+        ordering = ("-updated_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project"],
+                condition=Q(deleted_at__isnull=True),
+                name="issue_chat_workflow_policy_unique_active_project",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.project.name} ({'enabled' if self.enabled else 'disabled'})"
+
+
+class IssueChatWorkflowCursor(ProjectBaseModel):
+    class ManualResumeSource(models.TextChoices):
+        SOURCE_STATE = "source_state", "Source state"
+        TODO_STATE = "todo_state", "Todo state"
+
+    class CompletionCutoffSource(models.TextChoices):
+        EXISTING_STATE = "existing_state", "Existing state"
+        VERIFIED_REPORT = "verified_report", "Verified report"
+
+    issue = models.ForeignKey(
+        "db.Issue",
+        on_delete=models.CASCADE,
+        related_name="issue_chat_workflow_cursors",
+    )
+    policy = models.ForeignKey(
+        "db.IssueChatWorkflowPolicy",
+        on_delete=models.SET_NULL,
+        related_name="cursors",
+        null=True,
+        blank=True,
+    )
+    last_binding = models.ForeignKey(
+        "db.IssueChatBinding",
+        on_delete=models.SET_NULL,
+        related_name="workflow_cursors",
+        null=True,
+        blank=True,
+    )
+    expected_state = models.ForeignKey(
+        "db.State",
+        on_delete=models.SET_NULL,
+        related_name="issue_chat_workflow_expected_cursors",
+        null=True,
+        blank=True,
+    )
+    policy_version = models.PositiveBigIntegerField(default=0)
+    baseline_event_at = models.DateTimeField(null=True, blank=True)
+    manual_resume_cutoff_at = models.DateTimeField(null=True, blank=True)
+    manual_resume_cutoff_source = models.CharField(
+        max_length=20,
+        choices=ManualResumeSource.choices,
+        blank=True,
+        default="",
+    )
+    completion_cutoff_at = models.DateTimeField(null=True, blank=True)
+    completion_cutoff_source = models.CharField(
+        max_length=20,
+        choices=CompletionCutoffSource.choices,
+        blank=True,
+        default="",
+    )
+    completion_snapshots = models.JSONField(default=list)
+    last_turn_id = models.CharField(max_length=255, blank=True, default="")
+    last_observation_state = models.CharField(max_length=20, blank=True, default="")
+    last_reason = models.CharField(max_length=64, blank=True, default="")
+    last_applied_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Issue Chat Workflow Cursor"
+        verbose_name_plural = "Issue Chat Workflow Cursors"
+        db_table = "issue_chat_workflow_cursors"
+        ordering = ("-updated_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["issue"],
+                condition=Q(deleted_at__isnull=True),
+                name="issue_chat_workflow_cursor_unique_active_issue",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.issue_id} baseline={self.baseline_event_at}"
+
+
+class IssueChatWorkflowAudit(ProjectBaseModel):
+    policy = models.ForeignKey(
+        "db.IssueChatWorkflowPolicy",
+        on_delete=models.SET_NULL,
+        related_name="audits",
+        null=True,
+        blank=True,
+    )
+    issue = models.ForeignKey(
+        "db.Issue",
+        on_delete=models.CASCADE,
+        related_name="issue_chat_workflow_audits",
+    )
+    binding = models.ForeignKey(
+        "db.IssueChatBinding",
+        on_delete=models.SET_NULL,
+        related_name="workflow_audits",
+        null=True,
+        blank=True,
+    )
+    previous_state = models.ForeignKey(
+        "db.State",
+        on_delete=models.SET_NULL,
+        related_name="issue_chat_workflow_previous_audits",
+        null=True,
+        blank=True,
+    )
+    target_state = models.ForeignKey(
+        "db.State",
+        on_delete=models.SET_NULL,
+        related_name="issue_chat_workflow_target_audits",
+        null=True,
+        blank=True,
+    )
+    idempotency_key = models.CharField(max_length=64)
+    policy_version = models.PositiveBigIntegerField(default=0)
+    observation_state = models.CharField(max_length=20)
+    observed_at = models.DateTimeField()
+    turn_id = models.CharField(max_length=255, blank=True, default="")
+    applied = models.BooleanField(default=False)
+    reason = models.CharField(max_length=64)
+    details = models.JSONField(default=dict)
+
+    class Meta:
+        verbose_name = "Issue Chat Workflow Audit"
+        verbose_name_plural = "Issue Chat Workflow Audits"
+        db_table = "issue_chat_workflow_audits"
+        ordering = ("-created_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["idempotency_key"],
+                condition=Q(deleted_at__isnull=True),
+                name="issue_chat_workflow_audit_unique_idempotency_key",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["issue", "created_at"],
+                name="issue_chat_wf_audit_issue_idx",
+            ),
+            models.Index(
+                fields=["binding", "created_at"],
+                name="issue_chat_wf_audit_bind_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.issue_id} {self.reason}"
+
+
 def get_upload_path(instance, filename):
     filename = sanitize_filename(filename) or uuid4().hex
     return f"{instance.workspace.id}/{uuid4().hex}-{filename}"

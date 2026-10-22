@@ -1139,6 +1139,7 @@ def update_issue_chat_observation(
     state,
     observed_at,
     turn_id,
+    resume_after_stop=False,
 ):
     """Apply an idempotent typed Codex observation to an existing binding."""
 
@@ -1147,16 +1148,31 @@ def update_issue_chat_observation(
         raise IssueChatInputError("turn_id", "turn_id is required.")
     if state not in IssueChatBinding.ObservationState.values:
         raise IssueChatInputError("state", "A valid observation state is required.")
+    if resume_after_stop and state != IssueChatBinding.ObservationState.RUNNING:
+        raise IssueChatInputError(
+            "resume_after_stop",
+            "This flag is only valid for a running observation.",
+        )
 
     with transaction.atomic():
+        issue = (
+            _issue_queryset(workspace_slug, project_id)
+            .select_for_update(of=("self",))
+            .select_related("project", "state")
+            .filter(pk=issue_id)
+            .first()
+        )
+        if issue is None:
+            raise IssueChatNotFound
+
         binding = (
             IssueChatBinding.objects.select_for_update(of=("self",))
             .select_related("link")
             .filter(
                 pk=binding_id,
-                workspace__slug=workspace_slug,
-                project_id=project_id,
-                issue_id=issue_id,
+                workspace_id=issue.workspace_id,
+                project_id=issue.project_id,
+                issue_id=issue.id,
             )
             .first()
         )
@@ -1188,18 +1204,22 @@ def update_issue_chat_observation(
                 )
             if (
                 binding.observation_turn_id == normalized_turn_id
-                and binding.observation_state
-                in {
-                    IssueChatBinding.ObservationState.ANSWER_AVAILABLE,
-                    IssueChatBinding.ObservationState.NEEDS_ACTION,
-                    IssueChatBinding.ObservationState.FAILED,
-                }
                 and state == IssueChatBinding.ObservationState.RUNNING
             ):
-                raise IssueChatConflict(
-                    "invalid_transition",
-                    "A completed turn cannot return to running.",
-                )
+                if binding.observation_state == IssueChatBinding.ObservationState.FAILED:
+                    raise IssueChatConflict(
+                        "invalid_transition",
+                        "A failed turn cannot return to running.",
+                    )
+                if (
+                    binding.observation_state
+                    == IssueChatBinding.ObservationState.ANSWER_AVAILABLE
+                    and not resume_after_stop
+                ):
+                    raise IssueChatConflict(
+                        "invalid_transition",
+                        "A completed turn cannot return to running without resume_after_stop.",
+                    )
 
         binding.observation_state = state
         binding.observation_source = IssueChatBinding.ObservationSource.CODEX
@@ -1213,6 +1233,18 @@ def update_issue_chat_observation(
                 "observation_turn_id",
                 "updated_at",
             ]
+        )
+
+        from plane.utils.issue_chat_workflow import evaluate_issue_chat_workflow
+
+        evaluate_issue_chat_workflow(
+            workspace_slug=workspace_slug,
+            project_id=project_id,
+            issue_id=issue_id,
+            binding_id=binding_id,
+            observation_state=state,
+            observed_at=observed_at,
+            turn_id=normalized_turn_id,
         )
 
     return IssueChatObservationResult(binding=binding, applied=True)
