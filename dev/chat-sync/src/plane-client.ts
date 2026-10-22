@@ -21,12 +21,13 @@ export interface PlaneBinding {
   } | null;
 }
 
-export type PlaneObservationState = "running" | "answer_available";
+export type PlaneObservationState = "running" | "needs_action" | "answer_available" | "failed";
 
 export interface PlaneObservation {
   state: PlaneObservationState;
   observed_at: string;
   turn_id: string;
+  resume_after_stop?: boolean;
 }
 
 export type PlaneWriteResult =
@@ -272,7 +273,7 @@ export class PlaneClient {
       }
     }
 
-    if (response.status >= 500 || response.status === 408 || response.status === 425) {
+    if (response.status >= 500 || response.status === 408 || response.status === 425 || response.status === 429) {
       return { kind: "uncertain", status: response.status };
     }
 
@@ -323,7 +324,7 @@ export class PlaneClient {
       }
     }
 
-    if (response.status >= 500 || response.status === 408 || response.status === 425) {
+    if (response.status >= 500 || response.status === 408 || response.status === 425 || response.status === 429) {
       return { kind: "uncertain", status: response.status };
     }
 

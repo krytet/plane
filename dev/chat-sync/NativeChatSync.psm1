@@ -7,7 +7,7 @@ $script:AllowedConfigNames = @(
     "pollIntervalSeconds",
     "stateDir"
 )
-$script:HeartbeatNames = @(
+$script:RequiredHeartbeatNames = @(
     "pid",
     "updated_at",
     "workspace",
@@ -15,6 +15,26 @@ $script:HeartbeatNames = @(
     "exitCode",
     "threadCount"
 )
+$script:OptionalHeartbeatNames = @(
+    "processStartedAt",
+    "commandTag",
+    "stateDir",
+    "hookSpoolDir",
+    "hookBacklog",
+    "hookBacklogTruncated",
+    "hookLastEventAt",
+    "hookLastEvent",
+    "hookLastState",
+    "hookPendingCount",
+    "hookPendingTruncated",
+    "hookNewestPendingEventAt",
+    "hookNewestPendingEvent",
+    "hookNewestPendingState",
+    "hookLastAppliedAt",
+    "hookLastAppliedEvent",
+    "hookLastAppliedState"
+)
+$script:AllowedHeartbeatNames = $script:RequiredHeartbeatNames + $script:OptionalHeartbeatNames
 $script:MaxProcessAncestryDepth = 32
 
 function Get-NativeChatSyncServiceConfigPath {
@@ -221,6 +241,77 @@ function Test-NativeChatSyncProcessDescendant {
     return $false
 }
 
+function ConvertTo-NativeUtcDateTimeOffset {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Value
+    )
+
+    if ($Value -is [DateTimeOffset]) {
+        return $Value.ToUniversalTime()
+    }
+    if ($Value -is [DateTime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Unspecified) {
+            return [DateTimeOffset]::new([DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc))
+        }
+        return [DateTimeOffset]::new($Value.ToUniversalTime())
+    }
+    return [DateTimeOffset]::Parse(
+        [string] $Value,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::RoundtripKind
+    )
+}
+
+function Test-NativeChatSyncHeartbeatProcess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Heartbeat,
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Process,
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Config
+    )
+
+    $startedProperty = $Heartbeat.PSObject.Properties["processStartedAt"]
+    $commandTagProperty = $Heartbeat.PSObject.Properties["commandTag"]
+    $stateDirProperty = $Heartbeat.PSObject.Properties["stateDir"]
+    if (
+        $null -eq $startedProperty -or
+        $null -eq $commandTagProperty -or
+        $null -eq $stateDirProperty -or
+        [string]::IsNullOrWhiteSpace([string] $startedProperty.Value) -or
+        [string]::IsNullOrWhiteSpace([string] $stateDirProperty.Value) -or
+        -not [string]::Equals([string] $commandTagProperty.Value, "sync_codex_chats", [StringComparison]::Ordinal) -or
+        -not [string]::Equals(
+            [System.IO.Path]::GetFullPath([string] $stateDirProperty.Value),
+            $Config.StateDir,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        return $false
+    }
+
+    try {
+        $heartbeatStartedAt = ConvertTo-NativeUtcDateTimeOffset -Value $startedProperty.Value
+        $processStartedAt = ConvertTo-NativeUtcDateTimeOffset -Value $Process.CreationDate
+    } catch {
+        return $false
+    }
+    if ([Math]::Abs(($heartbeatStartedAt - $processStartedAt).TotalSeconds) -gt 2) {
+        return $false
+    }
+
+    $commandLine = [string] $Process.CommandLine
+    if ([string]::IsNullOrWhiteSpace($commandLine)) {
+        return $false
+    }
+    if ($commandLine.IndexOf("sync_codex_chats", [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        return $false
+    }
+    return $commandLine.IndexOf($Config.StateDir, [StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
 function Get-NativeChatSyncStatus {
     [CmdletBinding()]
     param(
@@ -251,7 +342,7 @@ function Get-NativeChatSyncStatus {
     }
     if (-not $PSBoundParameters.ContainsKey("ProcessSnapshot")) {
         $ProcessSnapshot = @(Get-CimInstance Win32_Process -ErrorAction Stop |
-            Select-Object ProcessId, ParentProcessId)
+            Select-Object ProcessId, ParentProcessId, CreationDate, CommandLine)
     } else {
         $ProcessSnapshot = @($ProcessSnapshot)
     }
@@ -293,8 +384,8 @@ function Get-NativeChatSyncStatus {
 
     $heartbeatNames = @($heartbeat.PSObject.Properties.Name)
     if (
-        $heartbeatNames.Count -ne $script:HeartbeatNames.Count -or
-        @($script:HeartbeatNames | Where-Object { $_ -notin $heartbeatNames }).Count -gt 0
+        @($script:RequiredHeartbeatNames | Where-Object { $_ -notin $heartbeatNames }).Count -gt 0 -or
+        @($heartbeatNames | Where-Object { $_ -notin $script:AllowedHeartbeatNames }).Count -gt 0
     ) {
         return [pscustomobject]@{
             Ok = $false
@@ -311,11 +402,7 @@ function Get-NativeChatSyncStatus {
         $intervalSeconds = [int] $heartbeat.intervalSeconds
         $exitCode = [int] $heartbeat.exitCode
         $threadCount = [int] $heartbeat.threadCount
-        $updatedAt = [DateTimeOffset]::Parse(
-            [string] $heartbeat.updated_at,
-            [System.Globalization.CultureInfo]::InvariantCulture,
-            [System.Globalization.DateTimeStyles]::RoundtripKind
-        )
+        $updatedAt = ConvertTo-NativeUtcDateTimeOffset -Value $heartbeat.updated_at
     } catch {
         return [pscustomobject]@{
             Ok = $false
@@ -327,18 +414,70 @@ function Get-NativeChatSyncStatus {
         }
     }
 
-    $liveCommandPid = @($ProcessSnapshot | Where-Object {
+    $liveProcess = @($ProcessSnapshot | Where-Object {
         $null -ne $_ -and [int] $_.ProcessId -eq $heartbeatPid
-    }).Count -gt 0
+    }) | Select-Object -First 1
+    $liveCommandPid = $null -ne $liveProcess
+    $ageSeconds = ($Now.ToUniversalTime() - $updatedAt.ToUniversalTime()).TotalSeconds
+    $freshnessSeconds = [Math]::Max(120, (3 * $Config.PollIntervalSeconds))
+    $isFresh = $ageSeconds -ge -60 -and $ageSeconds -le $freshnessSeconds
     if ($null -eq $OwnedProcess) {
+        if (-not $liveCommandPid) {
+            return [pscustomobject]@{
+                Ok = $false
+                State = "missing-owner"
+                Reason = "owned_process_missing"
+                StatusPath = $statusPath
+                OwnedProcess = $null
+                Heartbeat = $heartbeat
+                CommandPid = $heartbeatPid
+                AgeSeconds = $ageSeconds
+            }
+        }
+        $identityVerified = Test-NativeChatSyncHeartbeatProcess `
+            -Heartbeat $heartbeat `
+            -Process $liveProcess `
+            -Config $Config
+        $createdAfterHeartbeat = $false
+        try {
+            $processCreation = ConvertTo-NativeUtcDateTimeOffset -Value $liveProcess.CreationDate
+            $createdAfterHeartbeat = $processCreation -gt $updatedAt.ToUniversalTime().AddSeconds(2)
+        } catch {
+            $createdAfterHeartbeat = $false
+        }
+        if (-not $identityVerified) {
+            if (-not $isFresh -or $createdAfterHeartbeat) {
+                return [pscustomobject]@{
+                    Ok = $false
+                    State = "missing-owner"
+                    Reason = "stale_heartbeat_pid_reused"
+                    StatusPath = $statusPath
+                    OwnedProcess = $null
+                    Heartbeat = $heartbeat
+                    CommandPid = $heartbeatPid
+                    AgeSeconds = $ageSeconds
+                }
+            }
+            return [pscustomobject]@{
+                Ok = $false
+                State = "external"
+                Reason = "heartbeat_unverified"
+                StatusPath = $statusPath
+                OwnedProcess = $null
+                Heartbeat = $heartbeat
+                CommandPid = $heartbeatPid
+                AgeSeconds = $ageSeconds
+            }
+        }
         return [pscustomobject]@{
             Ok = $false
-            State = if ($liveCommandPid) { "external" } else { "missing-owner" }
-            Reason = if ($liveCommandPid) { "external_lock" } else { "owned_process_missing" }
+            State = "external"
+            Reason = "external_lock"
             StatusPath = $statusPath
             OwnedProcess = $null
             Heartbeat = $heartbeat
             CommandPid = $heartbeatPid
+            AgeSeconds = $ageSeconds
         }
     }
 
@@ -375,8 +514,6 @@ function Get-NativeChatSyncStatus {
         }
     }
 
-    $ageSeconds = ($Now.ToUniversalTime() - $updatedAt.ToUniversalTime()).TotalSeconds
-    $freshnessSeconds = [Math]::Max(120, (3 * $Config.PollIntervalSeconds))
     if ($ageSeconds -lt -60 -or $ageSeconds -gt $freshnessSeconds) {
         return [pscustomobject]@{
             Ok = $false

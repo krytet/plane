@@ -8,6 +8,7 @@ import os
 import subprocess
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from uuid import uuid4
 
@@ -141,6 +142,25 @@ def test_dry_run_generates_config_from_existing_bindings_without_credentials(tmp
     )
     binding_count = IssueChatBinding.objects.count()
     captured = {}
+    spool_dir = tmp_path / "hook-spool"
+    spool_dir.mkdir()
+    hook_id = str(uuid4())
+    (spool_dir / f"{hook_id}.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "id": hook_id,
+                "source": "codex_hook",
+                "event": "UserPromptSubmit",
+                "state": "running",
+                "terminal": False,
+                "thread_id": tenant["thread_id"],
+                "turn_id": str(uuid4()),
+                "observed_at": "2026-10-22T12:00:00.000000Z",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     def fake_run(config_path, token, dry_run):
         assert token is None
@@ -173,20 +193,45 @@ def test_dry_run_generates_config_from_existing_bindings_without_credentials(tmp
 
     config = captured["config"]
     assert config["planeBaseUrl"] == "http://127.0.0.1:8059"
+    assert config["hookSpoolDir"] == str(tmp_path / "hook-spool")
     assert config["progressMode"] == "structured_or_summary"
     assert len(config["threads"]) == 1
     assert config["threads"][0]["threadId"] == tenant["thread_id"]
     assert config["threads"][0]["url"] == f"codex://threads/{tenant['thread_id']}"
     assert "token" not in Path(tmp_path / "config.json").read_text(encoding="utf-8").lower()
     heartbeat = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
-    assert set(heartbeat) == {
+    assert {
         "pid",
         "updated_at",
         "workspace",
         "intervalSeconds",
         "exitCode",
         "threadCount",
-    }
+        "commandTag",
+        "stateDir",
+        "hookSpoolDir",
+        "hookPendingCount",
+        "hookPendingTruncated",
+        "hookNewestPendingEventAt",
+        "hookNewestPendingEvent",
+        "hookNewestPendingState",
+        "hookLastAppliedAt",
+        "hookLastAppliedEvent",
+        "hookLastAppliedState",
+    }.issubset(heartbeat)
+    assert heartbeat["commandTag"] == "sync_codex_chats"
+    assert heartbeat["stateDir"] == str(tmp_path)
+    assert heartbeat["hookSpoolDir"] == str(spool_dir)
+    assert heartbeat["hookPendingCount"] == 1
+    assert heartbeat["hookPendingTruncated"] is False
+    assert heartbeat["hookNewestPendingEventAt"] == "2026-10-22T12:00:00+00:00"
+    assert heartbeat["hookNewestPendingEvent"] == "UserPromptSubmit"
+    assert heartbeat["hookNewestPendingState"] == "running"
+    assert heartbeat["hookLastAppliedAt"] is None
+    assert heartbeat["hookLastAppliedEvent"] is None
+    assert heartbeat["hookLastAppliedState"] is None
+    if "processStartedAt" in heartbeat:
+        assert heartbeat["processStartedAt"].endswith("+00:00")
     assert heartbeat["workspace"] == tenant["workspace"].slug
     assert heartbeat["intervalSeconds"] == 30
     assert heartbeat["exitCode"] == 0
@@ -502,3 +547,67 @@ def test_service_guard_checks_during_interruptible_wait(tmp_path):
         assert guard.wait(30) == "disabled"
 
     sleep.assert_called_once()
+
+
+@pytest.mark.unit
+def test_status_reports_bounded_hook_diagnostics_without_event_payloads(tmp_path):
+    spool_dir = tmp_path / "hook-spool"
+    spool_dir.mkdir()
+    hook_id = str(uuid4())
+    (spool_dir / f"{hook_id}.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "id": hook_id,
+                "source": "codex_hook",
+                "event": "Stop",
+                "state": "answer_available",
+                "terminal": True,
+                "thread_id": str(uuid4()),
+                "turn_id": str(uuid4()),
+                "observed_at": "2026-10-22T12:00:00.000000Z",
+                "prompt": "must-not-appear",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "cursors.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "bindings": {
+                    "codex:test": {
+                        "cursor": 1,
+                        "hook": {
+                            "lastObservedAt": "2026-10-22T11:59:00.000000Z",
+                            "lastEvent": "PostToolUse",
+                            "lastState": "running",
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sync_codex_chats._write_status(
+        tmp_path / "status.json",
+        SimpleNamespace(slug="personal"),
+        30,
+        0,
+        1,
+        tmp_path,
+    )
+    content = (tmp_path / "status.json").read_text(encoding="utf-8")
+    heartbeat = json.loads(content)
+
+    assert heartbeat["hookSpoolDir"] == str(spool_dir)
+    assert heartbeat["hookPendingCount"] == 1
+    assert heartbeat["hookPendingTruncated"] is False
+    assert heartbeat["hookNewestPendingEventAt"] == "2026-10-22T12:00:00+00:00"
+    assert heartbeat["hookNewestPendingEvent"] == "Stop"
+    assert heartbeat["hookNewestPendingState"] == "answer_available"
+    assert heartbeat["hookLastAppliedAt"] == "2026-10-22T11:59:00+00:00"
+    assert heartbeat["hookLastAppliedEvent"] == "PostToolUse"
+    assert heartbeat["hookLastAppliedState"] == "running"
+    assert "must-not-appear" not in content

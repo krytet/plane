@@ -9,7 +9,7 @@ import re
 import socket
 import subprocess
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
@@ -53,6 +53,10 @@ NODE_ENV_ALLOWLIST = frozenset(
 )
 THREAD_UUID_V7_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+EVENT_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$",
     re.IGNORECASE,
 )
 CODEX_URL_RE = re.compile(
@@ -279,6 +283,7 @@ def _config_payload(workspace, targets, codex_executable, plane_base_url, state_
         "enabled": True,
         "planeBaseUrl": plane_base_url,
         "stateFile": str(state_directory / "cursors.json"),
+        "hookSpoolDir": str(state_directory / "hook-spool"),
         "pollIntervalSeconds": interval,
         "codexExecutable": codex_executable,
         "progressMode": "structured_or_summary",
@@ -300,9 +305,148 @@ def _write_config(config_path, payload):
             temporary_path.unlink()
 
 
-def _write_status(status_path, workspace, interval, exit_code, thread_count):
+def _process_started_at(pid=None):
+    if os.name != "nt":
+        return None
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FileTime(ctypes.Structure):
+            _fields_ = [
+                ("low", wintypes.DWORD),
+                ("high", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(0x1000, False, os.getpid() if pid is None else pid)
+        if not handle:
+            return None
+        try:
+            creation = FileTime()
+            empty = FileTime()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(empty),
+                ctypes.byref(empty),
+                ctypes.byref(empty),
+            ):
+                return None
+            ticks = (int(creation.high) << 32) | int(creation.low)
+            epoch = datetime(1601, 1, 1, tzinfo=dt_timezone.utc)
+            return epoch + timedelta(microseconds=ticks // 10)
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, OverflowError, ValueError):
+        return None
+
+
+def _hook_spool_diagnostics(spool_directory, limit=512):
+    backlog = 0
+    truncated = False
+    last_event_at = None
+    last_event = None
+    last_state = None
+    try:
+        with os.scandir(spool_directory) as entries:
+            for entry in entries:
+                if backlog >= limit:
+                    truncated = True
+                    break
+                try:
+                    if not entry.is_file(follow_symlinks=False) or not EVENT_UUID_RE.fullmatch(entry.name):
+                        continue
+                except OSError:
+                    continue
+                backlog += 1
+                try:
+                    if entry.stat(follow_symlinks=False).st_size > 64 * 1024:
+                        continue
+                    with open(entry.path, "rb") as handle:
+                        event = json.loads(handle.read(64 * 1024 + 1).decode("utf-8"))
+                    observed_at = datetime.fromisoformat(str(event["observed_at"]).replace("Z", "+00:00"))
+                    if observed_at.tzinfo is None:
+                        continue
+                    observed_at = observed_at.astimezone(dt_timezone.utc)
+                    if last_event_at is None or observed_at > last_event_at:
+                        last_event_at = observed_at
+                        last_event = event.get("event") if isinstance(event.get("event"), str) else None
+                        last_state = event.get("state") if isinstance(event.get("state"), str) else None
+                except (
+                    AttributeError,
+                    KeyError,
+                    OSError,
+                    TypeError,
+                    UnicodeDecodeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
+                    continue
+    except OSError:
+        pass
+    return backlog, truncated, last_event_at, last_event, last_state
+
+
+def _hook_state_diagnostics(state_file, limit=4 * 1024 * 1024):
+    last_applied_at = None
+    last_event = None
+    last_state = None
+    try:
+        with open(state_file, "rb") as handle:
+            content = handle.read(limit + 1)
+        if len(content) > limit:
+            return last_applied_at, last_event, last_state
+        state = json.loads(content.decode("utf-8"))
+        bindings = state.get("bindings") if isinstance(state, dict) else None
+        if not isinstance(bindings, dict):
+            return last_applied_at, last_event, last_state
+        for binding in bindings.values():
+            hook = binding.get("hook") if isinstance(binding, dict) else None
+            if not isinstance(hook, dict):
+                continue
+            observed_at_value = hook.get("lastObservedAt")
+            if not isinstance(observed_at_value, str):
+                continue
+            try:
+                observed_at = datetime.fromisoformat(observed_at_value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if observed_at.tzinfo is None:
+                continue
+            observed_at = observed_at.astimezone(dt_timezone.utc)
+            if last_applied_at is None or observed_at > last_applied_at:
+                last_applied_at = observed_at
+                last_event = hook.get("lastEvent") if isinstance(hook.get("lastEvent"), str) else None
+                last_state = hook.get("lastState") if isinstance(hook.get("lastState"), str) else None
+    except (OSError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        pass
+    return last_applied_at, last_event, last_state
+
+
+def _write_status(status_path, workspace, interval, exit_code, thread_count, state_directory):
     status_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = status_path.with_name(f".{status_path.name}.{os.getpid()}.tmp")
+    process_started_at = _process_started_at()
+    hook_spool_dir = state_directory / "hook-spool"
+    hook_backlog, hook_truncated, hook_last_event_at, hook_last_event, hook_last_state = _hook_spool_diagnostics(
+        hook_spool_dir
+    )
+    applied_at, applied_event, applied_state = _hook_state_diagnostics(state_directory / "cursors.json")
     payload = {
         "pid": os.getpid(),
         "updated_at": timezone.now().isoformat(),
@@ -310,6 +454,22 @@ def _write_status(status_path, workspace, interval, exit_code, thread_count):
         "intervalSeconds": interval,
         "exitCode": exit_code,
         "threadCount": thread_count,
+        "commandTag": "sync_codex_chats",
+        "stateDir": str(state_directory),
+        "hookSpoolDir": str(hook_spool_dir),
+        "hookPendingCount": hook_backlog,
+        "hookPendingTruncated": hook_truncated,
+        "hookNewestPendingEventAt": hook_last_event_at.isoformat() if hook_last_event_at is not None else None,
+        "hookNewestPendingEvent": hook_last_event,
+        "hookNewestPendingState": hook_last_state,
+        "hookLastAppliedAt": applied_at.isoformat() if applied_at is not None else None,
+        "hookLastAppliedEvent": applied_event,
+        "hookLastAppliedState": applied_state,
+        **(
+            {"processStartedAt": process_started_at.isoformat(timespec="microseconds")}
+            if process_started_at is not None
+            else {}
+        ),
     }
     try:
         with temporary_path.open("x", encoding="utf-8", newline="\n") as file_handle:
@@ -602,7 +762,14 @@ class Command(BaseCommand):
                     exit_code = 1 if active_count else 0
                     if active_count == 0 and not dry_run:
                         _revoke_local_bot_access(workspace)
-                    _write_status(status_path, workspace, options["interval"], exit_code, 0)
+                    _write_status(
+                        status_path,
+                        workspace,
+                        options["interval"],
+                        exit_code,
+                        0,
+                        state_directory,
+                    )
                     self.stdout.write(json.dumps({"event": "no_targets"}, separators=(",", ":")))
                     if options["once"]:
                         if exit_code:
@@ -646,6 +813,7 @@ class Command(BaseCommand):
                     options["interval"],
                     cycle_exit_code,
                     len(targets),
+                    state_directory,
                 )
                 if stdout:
                     self.stdout.write(stdout.rstrip())

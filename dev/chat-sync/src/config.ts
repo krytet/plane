@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 
 import { ChatSyncError } from "./errors.ts";
 
@@ -20,6 +20,7 @@ export interface AdapterConfig {
   enabled: boolean;
   planeBaseUrl: string;
   stateFile: string;
+  hookSpoolDir?: string;
   pollIntervalSeconds: number;
   codexExecutable: string;
   progressMode: ProgressMode;
@@ -30,6 +31,7 @@ const TOP_LEVEL_KEYS = new Set([
   "enabled",
   "planeBaseUrl",
   "stateFile",
+  "hookSpoolDir",
   "pollIntervalSeconds",
   "codexExecutable",
   "progressMode",
@@ -186,20 +188,37 @@ export async function loadConfig(configPath: string): Promise<AdapterConfig> {
   }
   const threads = raw.threads.map(parseThread);
   const identities = new Set<string>();
+  const threadIdentities = new Set<string>();
   for (const thread of threads) {
     const identity = `${thread.provider}:${thread.threadId}:${thread.workspaceSlug}:${thread.projectId}:${thread.issueId}`;
     if (identities.has(identity)) invalid();
     identities.add(identity);
+    const threadIdentity = `${thread.provider}:${thread.workspaceSlug}:${thread.threadId}`;
+    if (threadIdentities.has(threadIdentity)) invalid();
+    threadIdentities.add(threadIdentity);
   }
 
   const stateFileValue = raw.stateFile ?? "./.state/cursors.json";
   if (typeof stateFileValue !== "string" || !stateFileValue.trim()) invalid();
   const stateFile = resolve(dirname(configPath), stateFileValue);
+  let hookSpoolDir: string | undefined;
+  if (raw.hookSpoolDir !== undefined) {
+    if (
+      typeof raw.hookSpoolDir !== "string" ||
+      !raw.hookSpoolDir.trim() ||
+      raw.hookSpoolDir.length > 2_048 ||
+      !isAbsolute(raw.hookSpoolDir)
+    ) {
+      invalid();
+    }
+    hookSpoolDir = resolve(raw.hookSpoolDir);
+  }
 
   return {
     enabled: raw.enabled,
     planeBaseUrl,
     stateFile,
+    ...(hookSpoolDir ? { hookSpoolDir } : {}),
     pollIntervalSeconds,
     codexExecutable,
     progressMode,

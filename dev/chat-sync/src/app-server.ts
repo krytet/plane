@@ -25,6 +25,7 @@ export interface CodexTurnItem {
 export interface CodexTurn {
   id: string;
   status: "completed" | "interrupted" | "failed" | "inProgress";
+  startedAt?: number | null;
   completedAt: number | null;
   items: CodexTurnItem[];
 }
@@ -358,6 +359,13 @@ export class CodexAppServerClient implements CodexReader {
         this.failProtocol();
       }
       if (
+        value.startedAt !== undefined &&
+        value.startedAt !== null &&
+        (!Number.isInteger(value.startedAt) || (value.startedAt as number) < 0)
+      ) {
+        this.failProtocol();
+      }
+      if (
         value.completedAt !== undefined &&
         value.completedAt !== null &&
         (!Number.isInteger(value.completedAt) || (value.completedAt as number) < 0)
@@ -367,6 +375,7 @@ export class CodexAppServerClient implements CodexReader {
       return {
         id: value.id,
         status: value.status as CodexTurn["status"],
+        startedAt: (value.startedAt as number | null | undefined) ?? null,
         completedAt: (value.completedAt as number | null | undefined) ?? null,
         items: value.items as CodexTurnItem[],
       };

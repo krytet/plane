@@ -158,6 +158,41 @@ test("accepts an explicit structured-or-summary progress mode", async (t) => {
   assert.equal(config.progressMode, "structured_or_summary");
 });
 
+test("accepts an optional absolute hook spool directory", async (t) => {
+  const spool = join(tmpdir(), "plane-chat-sync-hook-spool");
+  const file = await configFile({ ...baseConfig(), hookSpoolDir: spool });
+  t.after(() => rm(file.directory, { recursive: true, force: true }));
+
+  const config = await loadConfig(file.path);
+
+  assert.equal(config.hookSpoolDir, spool);
+});
+
+test("rejects a relative hook spool directory", async (t) => {
+  const file = await configFile({ ...baseConfig(), hookSpoolDir: "./hooks" });
+  t.after(() => rm(file.directory, { recursive: true, force: true }));
+
+  await assert.rejects(
+    loadConfig(file.path),
+    (error: unknown) => error instanceof ChatSyncError && error.code === "config_invalid"
+  );
+});
+
+test("rejects multiple targets for one provider thread in the same workspace", async (t) => {
+  const value = baseConfig();
+  value.threads.push({
+    ...value.threads[0]!,
+    issueId: "00000000-0000-4000-8000-000000000002",
+  });
+  const file = await configFile(value);
+  t.after(() => rm(file.directory, { recursive: true, force: true }));
+
+  await assert.rejects(
+    loadConfig(file.path),
+    (error: unknown) => error instanceof ChatSyncError && error.code === "config_invalid"
+  );
+});
+
 test("rejects non-provider and non-canonical provider URLs", async (t) => {
   const urls = [
     "http://chatgpt.com/codex/tasks/example",

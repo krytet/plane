@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, readFile, rename } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import { normalizeUuid, type ThreadTarget } from "./config.ts";
 import { ChatSyncError } from "./errors.ts";
+import type { PlaneObservation } from "./plane-client.ts";
 import type { Progress } from "./status-block.ts";
 
 export interface PlanePayload {
@@ -22,12 +24,40 @@ export interface PendingWrite {
   payload: PlanePayload;
 }
 
+export interface PendingObservationWrite {
+  eventId?: string;
+  event?: string;
+  eventTerminal?: boolean;
+  observation: PlaneObservation;
+}
+
+export interface HookOrderingState {
+  lastEventId?: string;
+  lastObservedAt?: string;
+  lastEvent?: string;
+  lastState?: string;
+  activeTurnId?: string;
+  activeTurnStartedAt?: string;
+  terminalTurnIds?: string[];
+  softStoppedTurnIds?: string[];
+  blockedObservation?: {
+    code: string;
+    status: number;
+    at: string;
+    eventId?: string;
+  };
+  // Legacy state from the first hook-spool draft.
+  terminalTurnId?: string;
+}
+
 export interface BindingState {
   cursor: number;
   lastTurnId?: string;
   lastObservedTurnId?: string;
   lastPayloadHash?: string;
   pending?: PendingWrite;
+  pendingObservation?: PendingObservationWrite;
+  hook?: HookOrderingState;
   blocked?: {
     code: string;
     at: string;
@@ -58,6 +88,50 @@ function assertBindingState(value: unknown): asserts value is BindingState {
       !Number.isSafeInteger(value.pending.cursor) ||
       typeof value.pending.turnId !== "string" ||
       typeof value.pending.payloadHash !== "string"
+    ) {
+      throw new ChatSyncError("state_invalid");
+    }
+  }
+  if (value.pendingObservation !== undefined) {
+    const pendingObservation = value.pendingObservation;
+    if (
+      !isRecord(pendingObservation) ||
+      !isRecord(pendingObservation.observation) ||
+      typeof pendingObservation.observation.state !== "string" ||
+      typeof pendingObservation.observation.observed_at !== "string" ||
+      typeof pendingObservation.observation.turn_id !== "string" ||
+      (pendingObservation.observation.resume_after_stop !== undefined &&
+        typeof pendingObservation.observation.resume_after_stop !== "boolean") ||
+      (pendingObservation.eventId !== undefined && typeof pendingObservation.eventId !== "string") ||
+      (pendingObservation.event !== undefined && typeof pendingObservation.event !== "string") ||
+      (pendingObservation.eventTerminal !== undefined && typeof pendingObservation.eventTerminal !== "boolean")
+    ) {
+      throw new ChatSyncError("state_invalid");
+    }
+  }
+  if (value.hook !== undefined) {
+    const hook = value.hook;
+    if (
+      !isRecord(hook) ||
+      (hook.lastEventId !== undefined && typeof hook.lastEventId !== "string") ||
+      (hook.lastObservedAt !== undefined && typeof hook.lastObservedAt !== "string") ||
+      (hook.lastEvent !== undefined && typeof hook.lastEvent !== "string") ||
+      (hook.lastState !== undefined && typeof hook.lastState !== "string") ||
+      (hook.activeTurnId !== undefined && typeof hook.activeTurnId !== "string") ||
+      (hook.activeTurnStartedAt !== undefined && typeof hook.activeTurnStartedAt !== "string") ||
+      (hook.terminalTurnIds !== undefined &&
+        (!Array.isArray(hook.terminalTurnIds) ||
+          !hook.terminalTurnIds.every((turnId) => typeof turnId === "string"))) ||
+      (hook.softStoppedTurnIds !== undefined &&
+        (!Array.isArray(hook.softStoppedTurnIds) ||
+          !hook.softStoppedTurnIds.every((turnId) => typeof turnId === "string"))) ||
+      (hook.blockedObservation !== undefined &&
+        (!isRecord(hook.blockedObservation) ||
+          typeof hook.blockedObservation.code !== "string" ||
+          !Number.isInteger(hook.blockedObservation.status) ||
+          typeof hook.blockedObservation.at !== "string" ||
+          (hook.blockedObservation.eventId !== undefined && typeof hook.blockedObservation.eventId !== "string"))) ||
+      (hook.terminalTurnId !== undefined && typeof hook.terminalTurnId !== "string")
     ) {
       throw new ChatSyncError("state_invalid");
     }
@@ -111,6 +185,19 @@ function canonicalPayload(payload: PlanePayload): string {
   });
 }
 
+async function syncDirectory(directory: string): Promise<void> {
+  if (process.platform === "win32") return;
+  let handle;
+  try {
+    handle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
+    await handle.sync();
+  } catch {
+    // The data file itself is fsynced; some platforms do not permit directory fsync.
+  } finally {
+    await handle?.close();
+  }
+}
+
 function canonicalContent(payload: PlanePayload): string {
   return JSON.stringify({
     provider: payload.provider,
@@ -160,10 +247,14 @@ export class StateStore {
   async save(state: SyncState): Promise<void> {
     await mkdir(dirname(this.filePath), { recursive: true });
     const temporaryPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
+    const handle = await open(temporaryPath, "w", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(state, null, 2)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     await rename(temporaryPath, this.filePath);
+    await syncDirectory(dirname(this.filePath));
   }
 }

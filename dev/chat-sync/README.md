@@ -2,7 +2,9 @@
 
 This local adapter reads explicitly configured Codex threads through the Codex
 app-server protocol and posts progress to Plane's API-key `chat-bindings`
-endpoint. The only verified protocol target is exactly:
+endpoint. Codex lifecycle hooks provide the primary live observation channel;
+app-server turn timestamps remain a bounded fallback. The only verified
+protocol target is exactly:
 
 | Item                                     | Verified value                                                       |
 | ---------------------------------------- | -------------------------------------------------------------------- |
@@ -30,6 +32,11 @@ adapter's 2 MB protocol line limit.
 The adapter does not read Codex SQLite or JSONL storage, use a browser, inspect
 auth tokens, manage Codex/ChatGPT Desktop, call auth or write methods, or
 scrape ChatGPT threads. ChatGPT web/Desktop synchronization is unsupported.
+
+Hook spool processing still depends on this verified app-server initialization.
+If the exact Codex reader is unavailable or incompatible, the CLI stops
+fail-closed before the first cycle and leaves pending hook files unprocessed;
+hooks are not an alternative reader.
 
 ## Progress modes
 
@@ -76,7 +83,52 @@ block becomes a short extractive summary:
 
 The final message is selected from a `final_answer` agent item; an unphased
 agent message is accepted for older history. Commentary and partial answers
-are ignored. If the newest turn is not `completed`, the adapter waits.
+are ignored. A missing, malformed, or secret-containing answer does not suppress
+the completed-turn observation: `answer_available` is still posted without
+publishing the rejected text.
+
+## Lifecycle observations
+
+`sync_codex_chats` generates `hookSpoolDir` under its external `stateDir` and
+passes it to every daemon cycle. The metadata-only handler and installer live in
+[`hooks/`](hooks/README.md).
+
+| Codex event         | Observation                                                      |
+| ------------------- | ---------------------------------------------------------------- |
+| `UserPromptSubmit`  | `running`                                                        |
+| `PermissionRequest` | `needs_action`                                                   |
+| `PostToolUse`       | `running`, rate-limited to one heartbeat per turn per 30 seconds |
+| `Stop`              | `answer_available`                                               |
+| `Interrupt`         | `needs_action`                                                   |
+
+The handler stores only the canonical thread/turn UUIDs, event/state, terminal
+flag, stable event ID, and its exact receipt timestamp. It never stores prompts,
+tool input/output, assistant text, transcript paths, or the raw hook payload.
+Input is bounded, invalid input is a silent no-op, and spool writes use an
+fsynced temporary file plus atomic rename.
+
+`Stop` is a soft stop. Codex can emit another `Stop` if another Stop hook
+continues the turn, and a same-turn `UserPromptSubmit` or explicit
+`PostToolUse` may resume it without completing the Plane work item. That
+transition is sent with `resume_after_stop: true`; `Interrupt` remains terminal.
+The existing workflow finalizer remains the only completion path.
+`Interrupt` is terminal for its turn and suppresses a later `PostToolUse`
+`running` event for the same turn.
+
+Install the global hooks only after reviewing the exact generated command:
+
+```powershell
+python dev/chat-sync/hooks/install_hooks.py `
+  --spool-dir "$env:USERPROFILE\AppData\Local\plane-chat-sync\hook-spool" `
+  --interpreter "C:\Path\To\Python\python.exe"
+```
+
+That command is a dry run. Add `--apply` to copy the stable handler and append
+one managed handler per event to the global `hooks.json`. Existing handlers,
+top-level metadata, other events, `config.toml`, `notify`, and trust hashes are
+not modified; a timestamped `hooks.json` backup is created and repeat runs are
+idempotent. Open `/hooks` once after applying and trust the new definitions.
+Do not edit trust hashes by hand.
 
 ## Launcher-managed service
 
@@ -113,6 +165,13 @@ or changed configuration is not terminated; the launcher fails clearly and
 waits for the daemon's own graceful exit. The command owns `stateDir\sync.lock`,
 so a second launcher/manual process fails closed rather than running
 concurrently.
+
+The OS advisory lock is the sole runtime exclusion authority. Launcher status
+does not treat a bare PID as proof of an external worker: it also checks process
+creation time, command tag, and state-directory ownership. A PID created after
+the heartbeat or an old unverified heartbeat is treated as stale, allowing a
+startup attempt that will still fail safely if the lock is actually held. No
+process is terminated.
 
 The native launcher passes `--service-config <service.json>` to the command. The
 daemon rechecks that path during its loop and sleep interval: setting
@@ -161,8 +220,14 @@ a second worker against the same state directory fails closed.
 
 After every completed cycle, including a zero-binding cycle, the command
 atomically writes `<state-dir>/status.json` with `pid`, `updated_at`,
-`workspace`, `intervalSeconds`, `exitCode`, and `threadCount`. This heartbeat
-contains no chat text or token material.
+`workspace`, `intervalSeconds`, `exitCode`, and `threadCount`. New heartbeats
+also include process creation time, a `sync_codex_chats` command tag, state
+directory, hook spool path, and bounded spool diagnostics (`hookPendingCount`,
+`hookNewestPendingEventAt`, `hookLastAppliedAt`, and related pending/applied
+event/state fields). Pending fields describe only files still queued;
+`hookLastAppliedAt` comes from the durable binding lifecycle cursor, so an empty
+healthy queue remains distinguishable from a hook that was never delivered.
+This heartbeat contains no chat text or token material.
 
 Omit `--once` to refresh bindings and invoke the Node adapter serially every
 `--interval` seconds (default `30`).
@@ -197,6 +262,7 @@ use this shape, stored outside the repository:
   "enabled": true,
   "planeBaseUrl": "http://127.0.0.1:8059",
   "stateFile": "C:\\Users\\you\\AppData\\Local\\plane-chat-sync\\cursors.json",
+  "hookSpoolDir": "C:\\Users\\you\\AppData\\Local\\plane-chat-sync\\hook-spool",
   "pollIntervalSeconds": 30,
   "codexExecutable": "C:\\Users\\you\\AppData\\Local\\OpenAI\\Codex\\bin\\6257d9e8f63c0f2b\\codex.exe",
   "progressMode": "structured_or_summary",
@@ -221,7 +287,7 @@ containing key-like field names such as `apiKey`, `token`, or `secret` are
 rejected.
 
 ```powershell
-cd D:\projects\plane-chat-links-progress\dev\chat-sync
+cd D:\projects\plane\dev\chat-sync
 $env:PLANE_API_KEY = "<supplied by the local runner>"
 node src/cli.ts --config "$env:LOCALAPPDATA\plane-chat-sync\config.json" --once
 ```
@@ -249,6 +315,31 @@ key. The next cursor is greater than both the local cursor and the remote
 After a confirmed progress write, the adapter sends an `answer_available`
 observation. It does not change Plane workflow state.
 
+Hook observations are ordered by their source receipt timestamp. Before each
+observation POST the adapter durably stores it as pending; after a timeout,
+connection failure, malformed response, or 5xx it performs a GET reconciliation
+before any later retry. Pending evidence and its spool file are retained until
+GET proves it applied or a newer remote observation supersedes it. Events older
+than the current remote observation are acknowledged without regressing it, and
+events for threads absent from the existing binding set are discarded rather
+than creating bindings. Unbound global-hook events and invalid spool files are
+drained as skipped diagnostics instead of making the daemon heartbeat unhealthy.
+A binding deleted between config refresh and processing clears any pending
+observation without creating a replacement binding.
+
+Ordering metadata and the pending observation are checkpointed in the same
+atomic state write before any spool acknowledgement. A definitive 4xx rejection
+is persisted as a blocked reason and the event is quarantined; only stale 409
+or a proven newer remote observation is cleared automatically. Network and 5xx
+outcomes remain pending for GET reconciliation before retry.
+
+Timestamps are compared at full microsecond precision. Lifecycle ordering
+tracks the active turn plus a bounded terminal-turn history: only a
+`UserPromptSubmit` for a later turn can switch active work, and a delayed event
+from another turn cannot overwrite the current turn. Config rejects multiple
+targets for the same provider thread in one workspace so a spool acknowledgement
+always applies to exactly one binding.
+
 To recover a deliberately blocked binding, inspect the work item and state
 entry, back up the state file, then remove only that binding's `blocked` and,
 if necessary, stale `pending` fields. Do not lower or invent a cursor.
@@ -259,7 +350,7 @@ All adapter tests use mocks and do not start Codex app-server, contact Plane,
 or read live thread data.
 
 ```powershell
-cd D:\projects\plane-chat-links-progress\dev\chat-sync
+cd D:\projects\plane\dev\chat-sync
 npm test
 ```
 
@@ -267,7 +358,17 @@ Coverage includes exact version pinning, direct per-thread reads, newest-only
 summary parameters, missing-thread isolation, malformed-protocol failure,
 UUIDv7/native URL validation, strict and fallback progress modes, whole-answer
 secret detection, bounded summary extraction, no Plane access in dry-run, and
-uncertain-write GET reconciliation.
+uncertain-write GET reconciliation. Hook tests cover stable ordering, duplicate
+delivery, future/oversized/malformed events, replay after an uncertain write,
+unknown bindings, permission-to-running resumption, terminal suppression, and
+metadata-only payload storage.
+
+The dependency-free Python hook suite is:
+
+```powershell
+cd D:\projects\plane\dev\chat-sync\hooks
+python -m unittest -v test_hook_handler.py test_install_hooks.py
+```
 
 The Django command tests cover command discovery, binding membership and URL
 generation, loopback/state-directory guards, bot/project scoping, token

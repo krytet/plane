@@ -346,7 +346,133 @@ try {
             -ProcessSnapshot @([pscustomobject]@{ ProcessId = 200; ParentProcessId = 1 }) `
             -Now ([DateTimeOffset]::Parse('2026-10-21T12:00:30Z'))
         Assert-Equal -Actual $external.State -Expected 'external'
-        Assert-Equal -Actual $external.Reason -Expected 'external_lock'
+        Assert-Equal -Actual $external.Reason -Expected 'heartbeat_unverified'
+    }
+
+    Invoke-TestCase -Name 'PID created after the heartbeat is not treated as an external lock' -Test {
+        Write-JsonFile -Path $configPath -Value (New-ServiceConfig)
+        $config = Get-NativeChatSyncServiceConfig -ConfigPath $configPath -RepoRoot $repoRoot
+        Write-JsonFile -Path (Join-Path $stateDir 'status.json') -Value ([ordered]@{
+            pid = 53616
+            updated_at = '2026-10-22T08:00:00+00:00'
+            workspace = 'personal'
+            intervalSeconds = 30
+            exitCode = 0
+            threadCount = 4
+        })
+
+        $status = Get-NativeChatSyncStatus `
+            -Context ([pscustomobject]@{ RepoRoot = $repoRoot }) `
+            -Config $config `
+            -ApiBaseUrl 'http://127.0.0.1:8059' `
+            -OwnedProcess $null `
+            -ProcessSnapshot @([pscustomobject]@{
+                ProcessId = 53616
+                ParentProcessId = 1
+                CreationDate = [DateTimeOffset]::Parse('2026-10-22T08:00:10Z')
+                CommandLine = 'C:\Windows\System32\conhost.exe 0xffffffff'
+            }) `
+            -Now ([DateTimeOffset]::Parse('2026-10-22T08:10:00Z'))
+
+        Assert-Equal -Actual $status.Ok -Expected $false
+        Assert-Equal -Actual $status.State -Expected 'missing-owner'
+        Assert-Equal -Actual $status.Reason -Expected 'stale_heartbeat_pid_reused'
+    }
+
+    Invoke-TestCase -Name 'verified live heartbeat identity remains an external lock' -Test {
+        Write-JsonFile -Path $configPath -Value (New-ServiceConfig)
+        $config = Get-NativeChatSyncServiceConfig -ConfigPath $configPath -RepoRoot $repoRoot
+        $updatedAt = '2026-10-22T08:00:00.000000+00:00'
+        Write-JsonFile -Path (Join-Path $stateDir 'status.json') -Value ([ordered]@{
+            pid = 200
+            updated_at = $updatedAt
+            workspace = 'personal'
+            intervalSeconds = 30
+            exitCode = 0
+            threadCount = 2
+            processStartedAt = '2026-10-22T07:59:00.123456+00:00'
+            commandTag = 'sync_codex_chats'
+            stateDir = $stateDir
+        })
+
+        $status = Get-NativeChatSyncStatus `
+            -Context ([pscustomobject]@{ RepoRoot = $repoRoot }) `
+            -Config $config `
+            -ApiBaseUrl 'http://127.0.0.1:8059' `
+            -OwnedProcess $null `
+            -ProcessSnapshot @([pscustomobject]@{
+                ProcessId = 200
+                ParentProcessId = 1
+                CreationDate = [DateTimeOffset]::Parse('2026-10-22T07:59:00.123Z')
+                CommandLine = ('python manage.py sync_codex_chats --state-dir "{0}"' -f $stateDir)
+            }) `
+            -Now ([DateTimeOffset]::Parse('2026-10-22T08:00:30Z'))
+
+        Assert-Equal -Actual $status.State -Expected 'external'
+        Assert-Equal -Actual $status.Reason -Expected 'external_lock'
+    }
+
+    Invoke-TestCase -Name 'stale reused heartbeat permits startup attempt without killing a process' -Test {
+        $attemptState = Join-Path $tempRoot 'attempt-state'
+        $attemptPids = Join-Path $tempRoot 'attempt-pids'
+        $attemptLogs = Join-Path $tempRoot 'attempt-logs'
+        New-Item -ItemType Directory -Path $attemptState -Force | Out-Null
+        New-Item -ItemType Directory -Path $attemptPids -Force | Out-Null
+        New-Item -ItemType Directory -Path $attemptLogs -Force | Out-Null
+        $payload = New-ServiceConfig
+        $payload.stateDir = $attemptState
+        $attemptConfigPath = Join-Path $tempRoot 'attempt-service.json'
+        Write-JsonFile -Path $attemptConfigPath -Value $payload
+        Write-JsonFile -Path (Join-Path $attemptState 'status.json') -Value ([ordered]@{
+            pid = 53616
+            updated_at = '2026-10-21T12:00:00+00:00'
+            workspace = 'personal'
+            intervalSeconds = 30
+            exitCode = 0
+            threadCount = 4
+        })
+        $context = [pscustomobject]@{
+            RepoRoot = $repoRoot
+            ApiRoot = $repoRoot
+            PidsRoot = $attemptPids
+            LogsRoot = $attemptLogs
+        }
+        $global:CapturedStalePidStartup = $false
+        function global:Get-CimInstance {
+            [CmdletBinding()]
+            param([string] $ClassName)
+            return @([pscustomobject]@{
+                ProcessId = 53616
+                ParentProcessId = 1
+                CreationDate = [DateTimeOffset]::Parse('2026-10-22T08:00:00Z')
+                CommandLine = 'C:\Windows\System32\conhost.exe 0xffffffff'
+            })
+        }
+        function global:Start-NativeOwnedProcess {
+            $global:CapturedStalePidStartup = $true
+            throw 'CAPTURE_ONLY_NO_PROCESS'
+        }
+        try {
+            try {
+                Start-NativeChatSyncService `
+                    -Context $context `
+                    -UvxFile 'unused-uvx.exe' `
+                    -UvExactPrefix @('--from', 'uv==0.12.21', 'uv') `
+                    -ApiBaseUrl 'http://127.0.0.1:8059' `
+                    -ConfigPath $attemptConfigPath | Out-Null
+            } catch {
+                if ($_.Exception.Message -ne 'CAPTURE_ONLY_NO_PROCESS') {
+                    throw
+                }
+            }
+        } finally {
+            Remove-Item Function:\Get-CimInstance -ErrorAction SilentlyContinue
+            Remove-Item Function:\Start-NativeOwnedProcess -ErrorAction SilentlyContinue
+        }
+
+        Assert-True -Condition $global:CapturedStalePidStartup
+        Assert-Equal -Actual @(Get-ChildItem -LiteralPath $attemptPids -Force).Count -Expected 0
+        Assert-Equal -Actual @(Get-ChildItem -LiteralPath $attemptLogs -Force).Count -Expected 0
     }
 
     Invoke-TestCase -Name 'process ancestry traversal is bounded and rejects cycles' -Test {

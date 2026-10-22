@@ -2,6 +2,7 @@
   "enabled": false,
   "planeBaseUrl": "https://plane.example.com",
   "stateFile": "./state/cursors.json",
+  "hookSpoolDir": "C:\\Users\\you\\AppData\\Local\\plane-chat-sync\\hook-spool",
   "pollIntervalSeconds": 30,
   "codexExecutable": "codex",
   "progressMode": "status_block",

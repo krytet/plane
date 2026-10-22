@@ -34,6 +34,8 @@ const OBSERVATION = {
   turn_id: "turn-1",
 };
 
+const respondWithRateLimit = async () => new Response("", { status: 429 });
+
 const BINDING_RESPONSE = {
   id: "binding-1",
   provider: "codex",
@@ -230,4 +232,49 @@ test("returns uncertain once for an observation network failure", async () => {
 
   assert.deepEqual(result, { kind: "uncertain", status: null });
   assert.equal(calls, 1);
+});
+
+test("classifies HTTP 429 as uncertain for binding and observation writes", async () => {
+  const client = new PlaneClient({
+    baseUrl: "https://plane.example.com",
+    apiKey: "test-api-key",
+    fetchImpl: respondWithRateLimit as typeof fetch,
+  });
+
+  assert.deepEqual(await client.syncBinding(TARGET, PAYLOAD), { kind: "uncertain", status: 429 });
+  assert.deepEqual(await client.syncObservation(TARGET, "binding-manual", OBSERVATION), {
+    kind: "uncertain",
+    status: 429,
+  });
+});
+
+test("sends resume_after_stop only for the explicit resumed observation", async () => {
+  const bodies: unknown[] = [];
+  const fetchImpl = async (_input: string | URL | Request, init: RequestInit = {}) => {
+    bodies.push(JSON.parse(String(init.body)));
+    return new Response(
+      JSON.stringify({
+        id: "binding-manual",
+        provider: "codex",
+        thread_id: TARGET.threadId,
+        sync_cursor: 0,
+        progress: {},
+        link: null,
+        applied: true,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  };
+  const client = new PlaneClient({
+    baseUrl: "https://plane.example.com",
+    apiKey: "test-api-key",
+    fetchImpl: fetchImpl as typeof fetch,
+  });
+
+  await client.syncObservation(TARGET, "binding-manual", {
+    ...OBSERVATION,
+    resume_after_stop: true,
+  });
+
+  assert.deepEqual(bodies, [{ ...OBSERVATION, resume_after_stop: true }]);
 });

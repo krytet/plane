@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import type { CodexReader, CodexTurn } from "../src/app-server.ts";
@@ -11,6 +14,7 @@ import type {
   PlaneObservationWriteResult,
   PlaneWriteResult,
 } from "../src/plane-client.ts";
+import type { HookSpoolEvent } from "../src/hook-spool.ts";
 import type { PlanePayload, SyncState } from "../src/state.ts";
 import { runCycle, runDryRunCycle } from "../src/sync.ts";
 
@@ -129,7 +133,14 @@ class FakePlane {
   async syncBinding(_target: ThreadTarget, payload: PlanePayload): Promise<PlaneWriteResult> {
     this.posts.push(structuredClone(payload));
     if (this.mode === "success") {
-      this.remote = { ...asBinding(payload), id: this.remote?.id ?? "binding-1" };
+      this.remote = {
+        ...asBinding(payload),
+        id: this.remote?.id ?? "binding-1",
+        observation_state: this.remote?.observation_state ?? "unknown",
+        observation_source: this.remote?.observation_source ?? null,
+        observation_observed_at: this.remote?.observation_observed_at ?? null,
+        observation_turn_id: this.remote?.observation_turn_id ?? "",
+      };
       return { kind: "success", binding: structuredClone(this.remote) };
     }
     if (this.mode === "rejected") {
@@ -253,6 +264,21 @@ test("updates an existing cursor-zero binding and posts the completed observatio
   assert.equal(plane.observations[0]?.observation.observed_at, new Date(1_800_000_000 * 1_000).toISOString());
 });
 
+test("a persisted interrupted turn posts its source timestamp without treating notLoaded as live", async () => {
+  const reader = new FakeReader();
+  reader.turns = [{ ...completedTurn("turn-interrupted"), status: "interrupted", completedAt: 1_700_000_000 }];
+  const plane = new FakePlane();
+  plane.remote = manualBinding();
+
+  const result = await runCycle(reader, plane as unknown as PlaneClient, CONFIG, initialState(), save);
+
+  assert.equal(result.synced, 1);
+  assert.equal(plane.posts.length, 0);
+  assert.equal(plane.observations.length, 1);
+  assert.equal(plane.observations[0]?.observation.state, "needs_action");
+  assert.equal(plane.observations[0]?.observation.observed_at, new Date(1_700_000_000 * 1_000).toISOString());
+});
+
 test("uses freshly fetched binding URL and title instead of the config snapshot", async () => {
   const reader = new FakeReader();
   const plane = new FakePlane();
@@ -311,14 +337,114 @@ test("does not post a completed turn without a status block", async () => {
   const reader = new FakeReader();
   reader.turns = [completedTurn("turn-2", "Only arbitrary prose.")];
   const plane = new FakePlane();
+  plane.remote = manualBinding();
   const state = initialState();
 
   await runCycle(reader, plane as unknown as PlaneClient, CONFIG, state, async () => undefined);
 
   assert.equal(plane.posts.length, 0);
-  assert.equal(plane.observations.length, 0);
-  assert.equal(plane.gets, 0);
+  assert.equal(plane.observations.length, 1);
+  assert.equal(plane.observations[0]?.observation.state, "answer_available");
+  assert.equal(plane.gets, 1);
   assert.equal(state.bindings[STATE_KEY]?.lastObservedTurnId, "turn-2");
+});
+
+test("rejected secret text does not suppress the completed-turn observation", async () => {
+  const reader = new FakeReader();
+  reader.turns = [completedTurn("turn-secret", "The accidental value is plane_api_0123456789abcdef.")];
+  const plane = new FakePlane();
+  plane.remote = manualBinding();
+  const config: AdapterConfig = { ...CONFIG, progressMode: "structured_or_summary" };
+
+  const result = await runCycle(reader, plane as unknown as PlaneClient, config, initialState(), save);
+
+  assert.equal(result.errors, 1);
+  assert.equal(plane.posts.length, 0);
+  assert.equal(plane.observations.length, 1);
+  assert.equal(plane.observations[0]?.observation.state, "answer_available");
+  assert.doesNotMatch(JSON.stringify(plane.observations[0]), /plane_api_0123456789abcdef/);
+});
+
+test("a Stop hook records answer_available even when no final status text is available", async (t) => {
+  const spoolDirectory = await mkdtemp(join(tmpdir(), "plane-hook-adapter-"));
+  t.after(() => rm(spoolDirectory, { recursive: true, force: true }));
+  const event: HookSpoolEvent = {
+    version: 1,
+    id: "01900000-0000-7000-8000-000000000060",
+    source: "codex_hook",
+    event: "Stop",
+    state: "answer_available",
+    terminal: false,
+    thread_id: THREAD_ID,
+    turn_id: "01900000-0000-7000-8000-000000000061",
+    observed_at: new Date(Date.now() - 60_000).toISOString().replace("Z", "000Z"),
+  };
+  await writeFile(join(spoolDirectory, `${event.id}.json`), `${JSON.stringify(event)}\n`, "utf8");
+  const reader = new FakeReader();
+  reader.turns = [
+    {
+      ...completedTurn("turn-2", "Only arbitrary prose."),
+      completedAt: Math.floor(Date.now() / 1_000) - 3_600,
+    },
+  ];
+  const plane = new FakePlane();
+  plane.remote = manualBinding();
+  const config: AdapterConfig = { ...CONFIG, hookSpoolDir: spoolDirectory };
+
+  const result = await runCycle(reader, plane as unknown as PlaneClient, config, initialState(), save);
+
+  assert.equal(result.synced, 1);
+  assert.equal(plane.posts.length, 0);
+  assert.equal(plane.observations.length, 1);
+  assert.equal(plane.observations[0]?.observation.state, "answer_available");
+  assert.deepEqual(await readdir(spoolDirectory), []);
+});
+
+test("unbound global hook events and invalid spool files are nonfatal skips", async (t) => {
+  const spoolDirectory = await mkdtemp(join(tmpdir(), "plane-hook-adapter-"));
+  t.after(() => rm(spoolDirectory, { recursive: true, force: true }));
+  const unbound: HookSpoolEvent = {
+    version: 1,
+    id: "01900000-0000-7000-8000-000000000070",
+    source: "codex_hook",
+    event: "UserPromptSubmit",
+    state: "running",
+    terminal: false,
+    thread_id: "01900000-0000-7000-8000-000000000071",
+    turn_id: "01900000-0000-7000-8000-000000000072",
+    observed_at: new Date(Date.now() - 60_000).toISOString().replace("Z", "000Z"),
+  };
+  await writeFile(join(spoolDirectory, `${unbound.id}.json`), `${JSON.stringify(unbound)}\n`, "utf8");
+  await writeFile(join(spoolDirectory, "01900000-0000-7000-8000-000000000073.json"), "{invalid", "utf8");
+  const plane = new FakePlane();
+  plane.remote = manualBinding();
+  const config: AdapterConfig = { ...CONFIG, hookSpoolDir: spoolDirectory };
+
+  const result = await runCycle(new FakeReader(), plane as unknown as PlaneClient, config, initialState(), save);
+
+  assert.equal(result.errors, 0);
+  assert.equal(result.skipped, 2);
+  assert.equal(plane.posts.length, 1);
+  assert.deepEqual(await readdir(spoolDirectory), []);
+});
+
+test("an older app-server completion does not regress a newer native hook observation", async () => {
+  const reader = new FakeReader();
+  reader.turns = [{ ...completedTurn("turn-old", FINAL_MESSAGE), completedAt: 1_700_000_000 }];
+  const plane = new FakePlane();
+  plane.remote = {
+    ...manualBinding(),
+    observation_state: "running",
+    observation_source: "codex",
+    observation_observed_at: "2026-10-22T12:00:00.000Z",
+    observation_turn_id: "turn-current",
+  };
+
+  await runCycle(reader, plane as unknown as PlaneClient, CONFIG, initialState(), save);
+
+  assert.equal(plane.posts.length, 1);
+  assert.equal(plane.observations.length, 0);
+  assert.equal(plane.remote?.observation_observed_at, "2026-10-22T12:00:00.000Z");
 });
 
 test("reconciles an uncertain write with GET instead of blindly retrying", async () => {

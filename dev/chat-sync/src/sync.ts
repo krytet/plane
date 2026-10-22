@@ -1,6 +1,8 @@
 import type { AdapterConfig, ThreadTarget } from "./config.ts";
 import { assertSupportedProviders, normalizeUuid } from "./config.ts";
 import { ChatSyncError, codeForError } from "./errors.ts";
+import { HookSpoolReader, timestampMicros, type HookSpoolEvent } from "./hook-spool.ts";
+import { syncHookObservations } from "./hook-sync.ts";
 import type { CodexReader, CodexTurn } from "./app-server.ts";
 import type { PlaneBinding, PlaneClient, PlaneObservation, PlaneObservationWriteResult } from "./plane-client.ts";
 import {
@@ -98,14 +100,21 @@ function logSkipped(log: EventLogger, target: ThreadTarget, event: string, code?
 }
 
 function observationForTurn(turn: CodexTurn): PlaneObservation | null {
-  if (turn.status === "completed" && turn.completedAt !== null) {
-    return {
-      state: "answer_available",
-      observed_at: new Date(turn.completedAt * 1_000).toISOString(),
-      turn_id: turn.id,
-    };
-  }
-  return null;
+  if (turn.completedAt === null) return null;
+  const state =
+    turn.status === "completed"
+      ? "answer_available"
+      : turn.status === "interrupted"
+        ? "needs_action"
+        : turn.status === "failed"
+          ? "failed"
+          : null;
+  if (!state) return null;
+  return {
+    state,
+    observed_at: new Date(turn.completedAt * 1_000).toISOString(),
+    turn_id: turn.id,
+  };
 }
 
 function bindingMatchesObservation(binding: PlaneBinding, observation: PlaneObservation): boolean {
@@ -117,8 +126,9 @@ function bindingMatchesObservation(binding: PlaneBinding, observation: PlaneObse
   ) {
     return false;
   }
-  const observedAt = Date.parse(binding.observation_observed_at);
-  return Number.isFinite(observedAt) && observedAt === Date.parse(observation.observed_at);
+  const bindingObservedAt = timestampMicros(binding.observation_observed_at);
+  const observationObservedAt = timestampMicros(observation.observed_at);
+  return bindingObservedAt !== null && observationObservedAt !== null && bindingObservedAt === observationObservedAt;
 }
 
 async function reconcileObservation(
@@ -178,6 +188,12 @@ async function observeTurn(
 ): Promise<number> {
   const observation = observationForTurn(turn);
   if (!observation) return 0;
+  const observedAt = timestampMicros(observation.observed_at);
+  const remoteObservedAt = timestampMicros(binding.observation_observed_at);
+  if (observedAt !== null && remoteObservedAt !== null && remoteObservedAt >= observedAt) {
+    log({ event: "observation_already_applied", threadId: target.threadId, issueId: target.issueId });
+    return 0;
+  }
 
   let result: PlaneObservationWriteResult;
   try {
@@ -213,6 +229,30 @@ async function observeTurn(
     code: result.code ?? "observation_rejected",
   });
   return 1;
+}
+
+async function observeExistingTurn(
+  plane: PlaneClient,
+  target: ThreadTarget,
+  turn: CodexTurn,
+  log: EventLogger
+): Promise<number> {
+  let bindings: PlaneBinding[];
+  try {
+    bindings = await plane.listBindings(target);
+  } catch (error) {
+    if (error instanceof ChatSyncError && error.code === "plane_auth_failed") throw error;
+    log({
+      event: "observation_reconcile_failed",
+      threadId: target.threadId,
+      issueId: target.issueId,
+      code: codeForError(error),
+    });
+    return 1;
+  }
+  const remote = findRemoteBinding(bindings, target);
+  if (!remote) return 0;
+  return await observeTurn(plane, target, remote, turn, log);
 }
 
 async function syncTarget(
@@ -278,6 +318,10 @@ async function syncTarget(
   const newest = turns[0];
   if (!newest) return logSkipped(log, target, "no_turns");
   if (newest.status !== "completed" || newest.completedAt === null) {
+    if (observationForTurn(newest)) {
+      const errors = await observeExistingTurn(plane, target, newest, log);
+      return { synced: errors ? 0 : 1, skipped: errors ? 1 : 0, errors };
+    }
     return logSkipped(log, target, "latest_turn_not_completed");
   }
   if (state.lastObservedTurnId === newest.id) {
@@ -301,7 +345,9 @@ async function syncTarget(
   if (!finalText) {
     state.lastObservedTurnId = newest.id;
     await saveState();
-    return logSkipped(log, target, "no_final_agent_message", "status_block_missing");
+    const errors = await observeExistingTurn(plane, target, newest, log);
+    const result = logSkipped(log, target, "no_final_agent_message", "status_block_missing");
+    return { ...result, errors: result.errors + errors };
   }
 
   let progress;
@@ -310,7 +356,9 @@ async function syncTarget(
   } catch (error) {
     state.lastObservedTurnId = newest.id;
     await saveState();
-    return logSkipped(log, target, "invalid_status_block", codeForError(error));
+    const errors = await observeExistingTurn(plane, target, newest, log);
+    const result = logSkipped(log, target, "invalid_status_block", codeForError(error));
+    return { ...result, errors: result.errors + errors };
   }
 
   let bindings: PlaneBinding[];
@@ -427,9 +475,56 @@ export async function runCycle(
   assertSupportedProviders(config);
   const summary: CycleResult = { synced: 0, skipped: 0, errors: 0 };
   const targets = config.threads;
+  const spool = config.hookSpoolDir ? new HookSpoolReader(config.hookSpoolDir) : null;
+  const configuredThreads = new Set(targets.map((target) => target.threadId.toLowerCase()));
+  let hookEvents: HookSpoolEvent[] = [];
+  if (spool) {
+    try {
+      const batch = await spool.readBatch(Date.now(), configuredThreads);
+      hookEvents = batch.events;
+      summary.skipped += batch.invalid.length;
+      await Promise.all(
+        batch.invalid.map(async (invalid) => {
+          log({ event: "hook_spool_rejected", code: invalid.code });
+          try {
+            await spool.reject(invalid.fileName);
+          } catch {
+            log({ event: "hook_spool_reject_failed", code: invalid.code });
+          }
+        })
+      );
+    } catch (error) {
+      log({ event: "hook_spool_read_failed", code: codeForError(error) });
+      summary.errors += 1;
+    }
+  }
+
+  const unknownEvents = hookEvents.filter((event) => !configuredThreads.has(event.thread_id));
+  summary.skipped += unknownEvents.length;
+  await Promise.all(
+    unknownEvents.map(async (event) => {
+      log({ event: "hook_unknown_binding", threadId: event.thread_id });
+      if (!spool) return;
+      try {
+        await spool.acknowledge(event.id);
+      } catch {
+        log({ event: "hook_ack_failed", threadId: event.thread_id });
+      }
+    })
+  );
 
   for (const target of targets) {
     try {
+      if (spool) {
+        const targetEvents = hookEvents.filter((event) => event.thread_id === target.threadId.toLowerCase());
+        const bindingState = getBindingState(state, target);
+        // oxlint-disable-next-line no-await-in-loop
+        const hookResult = await syncHookObservations(plane, target, bindingState, targetEvents, spool, saveState, log);
+        summary.synced += hookResult.synced;
+        summary.skipped += hookResult.skipped;
+        summary.errors += hookResult.errors;
+      }
+
       // Targets are processed serially so one shared state file is updated in
       // a deterministic order.
       // oxlint-disable-next-line no-await-in-loop
