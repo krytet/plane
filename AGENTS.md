@@ -43,3 +43,28 @@ Prereq (once): `./setup.sh` — generates `apps/api/.env` from `.env.example`.
 - Teardown: `docker compose -f docker-compose-test.yml down -v`
 
 See `apps/api/tests/RUNNING_TESTS.md` for the full walkthrough and troubleshooting; see `apps/api/tests/TESTING_GUIDE.md` for test conventions and fixtures.
+
+## Linked chat completion
+
+This policy applies to agents operating on the Plane repository only. Other
+repositories must opt in to an equivalent project-level contract; it is not
+globally auto-injected.
+
+When the current chat has a verified exact Plane binding and its assigned task
+implementation is genuinely complete and verified, the agent must invoke the
+existing `finalize_llm_complete` command with the verified operator, workspace,
+project, and issue identifiers. The description and progress must be truthful
+Russian prose, and the command must receive authentic screenshot(s) captured
+during verification. There must be no outstanding decision, permission request,
+blocker, or failure.
+
+After finalization, read the issue back and confirm that the command reported
+`dry_run: false` and `pdf.readback_verified: true`, and that the issue state is
+the exact `LLM Complete` state. If any required input is missing or verification
+fails, leave the issue in Requires attention and report the blocker.
+
+Never bypass the finalizer with an arbitrary direct state patch. Never infer
+task completion from a Codex `Stop` event. Never finalize diagnosis-only tasks,
+new-monitor tasks, or items in a human-paused/protected state. Never invent
+binding identifiers, operator identity, screenshots, verification evidence, or
+description/progress content.

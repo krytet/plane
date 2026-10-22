@@ -17,6 +17,7 @@ import { WorkItemFiltersRow } from "@/components/work-item-filters/filters-row";
 // hooks
 import { useIssues } from "@/hooks/store/use-issues";
 import { IssuesStoreContext } from "@/hooks/use-issue-layout-store";
+import { useProjectBoardAutoRefresh } from "@/hooks/use-project-board-auto-refresh";
 // local imports
 import { IssuePeekOverview } from "../../peek-overview";
 import { CalendarLayout } from "../calendar/roots/project-root";
@@ -52,6 +53,12 @@ export const ProjectLayoutRoot = observer(function ProjectLayoutRoot() {
   // derived values
   const workItemFilters = projectId ? issuesFilter?.getIssueFilters(projectId) : undefined;
   const activeLayout = workItemFilters?.displayFilters?.layout;
+
+  useProjectBoardAutoRefresh({
+    workspaceSlug,
+    projectId,
+    enabled: activeLayout === EIssueLayoutTypes.LIST || activeLayout === EIssueLayoutTypes.KANBAN,
+  });
 
   useSWR(
     workspaceSlug && projectId ? `PROJECT_ISSUES_${workspaceSlug}_${projectId}` : null,

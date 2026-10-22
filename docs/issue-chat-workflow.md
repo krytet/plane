@@ -138,3 +138,35 @@ deadlock.
 The backend accepts same-turn `needs_action` to `running`. The local hook
 producer is maintained separately; backend configuration does not depend on
 its transport details.
+
+## Agent completion contract
+
+This contract is scoped to agents operating in the Plane repository. Other
+repositories require an explicit opt-in equivalent in their own instructions;
+this policy is not globally auto-injected.
+
+An agent may finalize only when all of the following are verified:
+
+- the current chat has an exact Plane binding to the intended workspace,
+  project, and issue, and the operator is verified;
+- the assigned task implementation is genuinely complete and has passed the
+  required verification;
+- there is no outstanding decision, permission request, blocker, or failure;
+- the issue is not diagnosis-only, newly created monitoring-only work, or in a
+  human-paused/protected state;
+- authentic screenshot evidence and truthful Russian description/progress are
+  available without inventing or inferring identifiers or evidence.
+
+When those conditions hold, invoke the existing `finalize_llm_complete` command
+with the verified operator, workspace, project, issue, screenshots, Russian
+description, and Russian progress. Do not set the state through an arbitrary
+direct patch.
+
+Read the issue back after the command and require both `dry_run: false` and
+`pdf.readback_verified: true`, together with the exact `LLM Complete` state. If
+the binding, operator, evidence, required input, command result, or readback is
+missing or invalid, leave the issue in Requires attention and report the
+blocker.
+
+A Codex `Stop` event, an `answer_available` observation, or the end of a chat is
+not proof of task completion and must never be used to infer it.
