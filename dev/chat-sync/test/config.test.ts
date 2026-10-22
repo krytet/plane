@@ -22,7 +22,7 @@ function baseConfig() {
     threads: [
       {
         provider: "codex",
-        threadId: "thread-1",
+        threadId: "01900000-0000-7000-8000-000000000000",
         workspaceSlug: "workspace",
         projectId: "00000000-0000-4000-8000-000000000000",
         issueId: "00000000-0000-4000-8000-000000000001",
@@ -38,6 +38,7 @@ test("loads an explicit opt-in config and resolves state next to it", async (t) 
 
   const config = await loadConfig(file.path);
   assert.equal(config.enabled, true);
+  assert.equal(config.progressMode, "status_block");
   assert.equal(config.threads.length, 1);
   assert.equal(config.stateFile, join(file.directory, ".state", "cursors.json"));
 });
@@ -93,7 +94,7 @@ test("normalizes provider URLs with uppercase hosts, trailing dots, and the defa
 
 test("normalizes UUID thread, project, and issue identifiers", async (t) => {
   const value = baseConfig();
-  value.threads[0]!.threadId = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE";
+  value.threads[0]!.threadId = "AAAAAAAA-BBBB-7CCC-8DDD-EEEEEEEEEEEE";
   value.threads[0]!.projectId = "00000000-0000-4000-8000-00000000000A";
   value.threads[0]!.issueId = "00000000-0000-4000-8000-00000000000B";
   const file = await configFile(value);
@@ -101,9 +102,60 @@ test("normalizes UUID thread, project, and issue identifiers", async (t) => {
 
   const config = await loadConfig(file.path);
 
-  assert.equal(config.threads[0]!.threadId, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+  assert.equal(config.threads[0]!.threadId, "aaaaaaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee");
   assert.equal(config.threads[0]!.projectId, "00000000-0000-4000-8000-00000000000a");
   assert.equal(config.threads[0]!.issueId, "00000000-0000-4000-8000-00000000000b");
+});
+
+test("accepts an exact native Codex URL tied to a normalized UUIDv7 thread", async (t) => {
+  const value = baseConfig();
+  value.threads[0]!.threadId = "01900000-0000-7000-8000-0000000000AA";
+  value.threads[0]!.url = "codex://threads/01900000-0000-7000-8000-0000000000AA";
+  const file = await configFile(value);
+  t.after(() => rm(file.directory, { recursive: true, force: true }));
+
+  const config = await loadConfig(file.path);
+
+  assert.equal(config.threads[0]!.threadId, "01900000-0000-7000-8000-0000000000aa");
+  assert.equal(config.threads[0]!.url, "codex://threads/01900000-0000-7000-8000-0000000000aa");
+});
+
+test("rejects wrong native schemes and URLs that do not match the target thread", async (t) => {
+  const threadId = "01900000-0000-7000-8000-000000000000";
+  const urls = [
+    "codex://threads/01900000-0000-7000-8000-000000000001",
+    "codex://thread/01900000-0000-7000-8000-000000000000",
+    "codex://threads/01900000-0000-7000-8000-000000000000/",
+    "codex://threads/01900000-0000-7000-8000-000000000000?source=test",
+    "codex://user@01900000-0000-7000-8000-000000000000",
+    "chatgpt://threads/01900000-0000-7000-8000-000000000000",
+  ];
+
+  await Promise.all(
+    urls.map(async (url) => {
+      const value = baseConfig();
+      value.threads[0]!.threadId = threadId;
+      value.threads[0]!.url = url;
+      const file = await configFile(value);
+      t.after(() => rm(file.directory, { recursive: true, force: true }));
+
+      await assert.rejects(loadConfig(file.path), (error: unknown) => {
+        assert.ok(error instanceof ChatSyncError);
+        assert.equal(error.code, "config_invalid");
+        return true;
+      });
+    })
+  );
+});
+
+test("accepts an explicit structured-or-summary progress mode", async (t) => {
+  const value = { ...baseConfig(), progressMode: "structured_or_summary" };
+  const file = await configFile(value);
+  t.after(() => rm(file.directory, { recursive: true, force: true }));
+
+  const config = await loadConfig(file.path);
+
+  assert.equal(config.progressMode, "structured_or_summary");
 });
 
 test("rejects non-provider and non-canonical provider URLs", async (t) => {

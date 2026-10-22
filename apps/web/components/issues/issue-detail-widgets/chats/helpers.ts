@@ -75,6 +75,36 @@ export const formatIssueChatObservationFreshness = (
   return "Observed just now";
 };
 
+export const formatIssueChatProgressSyncFreshness = (
+  syncedAt: string | null | undefined,
+  hasProgress: boolean,
+  now = Date.now()
+): string => {
+  if (!hasProgress) return "No progress synced yet";
+  if (!syncedAt) return "Progress sync time unavailable";
+
+  const timestamp = Date.parse(syncedAt);
+  if (Number.isNaN(timestamp)) return "Progress sync time unavailable";
+
+  const elapsedSeconds = Math.max(0, Math.floor((now - timestamp) / 1000));
+  if (elapsedSeconds < 60) return "Progress synced just now";
+
+  const units = [
+    { seconds: 86_400, label: "day" },
+    { seconds: 3_600, label: "hour" },
+    { seconds: 60, label: "minute" },
+  ] as const;
+
+  for (const unit of units) {
+    if (elapsedSeconds >= unit.seconds) {
+      const count = Math.floor(elapsedSeconds / unit.seconds);
+      return `Progress synced ${count} ${unit.label}${count === 1 ? "" : "s"} ago`;
+    }
+  }
+
+  return "Progress synced just now";
+};
+
 export const getIssueChatPlaneReadLabel = (
   binding: Pick<TIssueChatBinding, "attention" | "unread" | "seen_at">
 ): string | undefined => {
@@ -168,4 +198,104 @@ export const getSafeIssueChatWebLink = (value: string | null | undefined): strin
   } catch {
     return undefined;
   }
+};
+
+export const ISSUE_CHAT_REFRESH_INTERVAL_MS = 15_000;
+
+export type TIssueChatRefreshTrigger = "interval" | "focus" | "manual";
+
+type TIssueChatRefreshLifecycleGuard = {
+  identity: string;
+  requestId: number;
+};
+
+type TIssueChatRefreshGuard = TIssueChatRefreshLifecycleGuard & {
+  mutationRevision: number;
+};
+
+export const isCurrentIssueChatRefreshLifecycle = (
+  request: TIssueChatRefreshLifecycleGuard,
+  current: TIssueChatRefreshLifecycleGuard
+): boolean => request.identity === current.identity && request.requestId === current.requestId;
+
+export const shouldApplyIssueChatRefresh = (
+  request: TIssueChatRefreshGuard,
+  current: TIssueChatRefreshGuard
+): boolean =>
+  isCurrentIssueChatRefreshLifecycle(request, current) && request.mutationRevision === current.mutationRevision;
+
+export const finishIssueChatMutation = (options: {
+  mutationIdentity: string;
+  currentIdentity: string;
+  isMounted: boolean;
+  mutationRevision: number;
+}): { isCurrent: boolean; mutationRevision: number } => {
+  const isCurrent = options.isMounted && options.mutationIdentity === options.currentIdentity;
+  return {
+    isCurrent,
+    mutationRevision: isCurrent ? options.mutationRevision + 1 : options.mutationRevision,
+  };
+};
+
+export const shouldPollIssueChatBindings = (options: {
+  widgetOpen: boolean;
+  disabled: boolean;
+  hasCodexBinding: boolean;
+  isDocumentVisible: boolean;
+}): boolean => options.widgetOpen && !options.disabled && options.hasCodexBinding && options.isDocumentVisible;
+
+type TIssueChatRefreshScheduler = {
+  start: () => void;
+  stop: () => void;
+  request: (trigger?: TIssueChatRefreshTrigger) => Promise<void>;
+};
+
+type TIssueChatRefreshSchedulerOptions = {
+  refresh: (trigger: TIssueChatRefreshTrigger) => Promise<void> | void;
+  intervalMs?: number;
+  scheduleInterval?: (callback: () => void, intervalMs: number) => ReturnType<typeof setInterval>;
+  cancelInterval?: (handle: ReturnType<typeof setInterval>) => void;
+};
+
+export const createIssueChatRefreshScheduler = (
+  options: TIssueChatRefreshSchedulerOptions
+): TIssueChatRefreshScheduler => {
+  const intervalMs = options.intervalMs ?? ISSUE_CHAT_REFRESH_INTERVAL_MS;
+  const scheduleInterval = options.scheduleInterval ?? setInterval;
+  const cancelInterval = options.cancelInterval ?? clearInterval;
+  let intervalHandle: ReturnType<typeof setInterval> | undefined;
+  let active = false;
+  let inFlight: Promise<void> | undefined;
+
+  const request = (trigger: TIssueChatRefreshTrigger = "interval"): Promise<void> => {
+    if (inFlight) return inFlight;
+
+    let requestPromise: Promise<void>;
+    requestPromise = Promise.resolve()
+      .then(() => options.refresh(trigger))
+      .then(() => undefined)
+      .catch(() => undefined)
+      .finally(() => {
+        if (inFlight === requestPromise) inFlight = undefined;
+      });
+    inFlight = requestPromise;
+    return requestPromise;
+  };
+
+  const start = () => {
+    if (active) return;
+    active = true;
+    intervalHandle = scheduleInterval(() => {
+      if (active) void request("interval");
+    }, intervalMs);
+  };
+
+  const stop = () => {
+    active = false;
+    if (intervalHandle === undefined) return;
+    cancelInterval(intervalHandle);
+    intervalHandle = undefined;
+  };
+
+  return { start, stop, request };
 };

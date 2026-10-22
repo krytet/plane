@@ -17,7 +17,7 @@ export interface PlaneBinding {
   observation_turn_id: string;
   link: {
     url: string;
-    title: string;
+    title: string | null;
   } | null;
 }
 
@@ -123,10 +123,14 @@ function parseBinding(value: unknown): PlaneBinding {
 
   let link: PlaneBinding["link"] = null;
   if (value.link != null) {
-    if (!isRecord(value.link) || typeof value.link.url !== "string" || typeof value.link.title !== "string") {
+    if (
+      !isRecord(value.link) ||
+      typeof value.link.url !== "string" ||
+      (value.link.title !== null && typeof value.link.title !== "string")
+    ) {
       throw new ChatSyncError("plane_read_failed");
     }
-    link = { url: value.link.url, title: value.link.title };
+    link = { url: value.link.url, title: value.link.title ?? "" };
   }
 
   return {

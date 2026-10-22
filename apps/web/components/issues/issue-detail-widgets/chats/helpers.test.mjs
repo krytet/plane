@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 // local imports
 import {
+  createIssueChatRefreshScheduler,
+  finishIssueChatMutation,
   formatIssueChatObservationFreshness,
+  formatIssueChatProgressSyncFreshness,
   getIssueChatManualAttentionAction,
   getIssueChatObservationSourceLabel,
   getIssueChatObservationStateLabel,
@@ -12,7 +15,10 @@ import {
   getIssueChatUrlValidationError,
   getIssueChatProviderLabel,
   getSafeIssueChatWebLink,
+  isCurrentIssueChatRefreshLifecycle,
   isValidIssueChatUrl,
+  shouldApplyIssueChatRefresh,
+  shouldPollIssueChatBindings,
 } from "./helpers.ts";
 
 test("labels observations and their source without claiming provider read state", () => {
@@ -39,6 +45,17 @@ test("formats observation freshness without implying automatic sync", () => {
   assert.equal(formatIssueChatObservationFreshness("2026-10-21T11:59:45Z", now), "Observed just now");
   assert.equal(formatIssueChatObservationFreshness("2026-10-21T10:00:00Z", now), "Observed 2 hours ago");
   assert.equal(formatIssueChatObservationFreshness("2026-10-19T12:00:00Z", now), "Observed 2 days ago");
+});
+
+test("formats progress sync separately from provider observation time", () => {
+  const now = Date.parse("2026-10-21T12:00:00Z");
+
+  assert.equal(formatIssueChatProgressSyncFreshness(null, false, now), "No progress synced yet");
+  assert.equal(formatIssueChatProgressSyncFreshness(null, true, now), "Progress sync time unavailable");
+  assert.equal(formatIssueChatProgressSyncFreshness("invalid", true, now), "Progress sync time unavailable");
+  assert.equal(formatIssueChatProgressSyncFreshness("2026-10-21T11:59:45Z", true, now), "Progress synced just now");
+  assert.equal(formatIssueChatProgressSyncFreshness("2026-10-21T10:00:00Z", true, now), "Progress synced 2 hours ago");
+  assert.equal(formatIssueChatProgressSyncFreshness("2026-10-19T12:00:00Z", true, now), "Progress synced 2 days ago");
 });
 
 test("offers manual attention only for ChatGPT bindings", () => {
@@ -90,4 +107,118 @@ test("builds and validates only exact native Codex thread deep links", () => {
     getSafeIssueChatWebLink("https://chatgpt.com/codex/tasks/example"),
     "https://chatgpt.com/codex/tasks/example"
   );
+});
+
+test("rejects stale refresh results after identity, request, or mutation changes", () => {
+  const current = { identity: "workspace:project:issue", requestId: 4, mutationRevision: 7 };
+  const newerMutation = { ...current, mutationRevision: 8 };
+
+  assert.equal(shouldApplyIssueChatRefresh(current, current), true);
+  assert.equal(isCurrentIssueChatRefreshLifecycle(current, newerMutation), true);
+  assert.equal(shouldApplyIssueChatRefresh(current, newerMutation), false);
+  assert.equal(shouldApplyIssueChatRefresh({ ...current, identity: "other-issue" }, current), false);
+  assert.equal(shouldApplyIssueChatRefresh({ ...current, requestId: 3 }, current), false);
+  assert.equal(shouldApplyIssueChatRefresh({ ...current, mutationRevision: 6 }, current), false);
+});
+
+test("finishes only current-issue mutations before advancing the revision fence", () => {
+  const current = {
+    mutationIdentity: "workspace:project:issue",
+    currentIdentity: "workspace:project:issue",
+    isMounted: true,
+    mutationRevision: 7,
+  };
+
+  assert.deepEqual(finishIssueChatMutation(current), { isCurrent: true, mutationRevision: 8 });
+  assert.deepEqual(finishIssueChatMutation({ ...current, currentIdentity: "other-issue" }), {
+    isCurrent: false,
+    mutationRevision: 7,
+  });
+  assert.deepEqual(finishIssueChatMutation({ ...current, isMounted: false }), {
+    isCurrent: false,
+    mutationRevision: 7,
+  });
+});
+
+test("polls only while an open Codex widget is visible and enabled", () => {
+  const enabled = {
+    widgetOpen: true,
+    disabled: false,
+    hasCodexBinding: true,
+    isDocumentVisible: true,
+  };
+
+  assert.equal(shouldPollIssueChatBindings(enabled), true);
+  assert.equal(shouldPollIssueChatBindings({ ...enabled, widgetOpen: false }), false);
+  assert.equal(shouldPollIssueChatBindings({ ...enabled, disabled: true }), false);
+  assert.equal(shouldPollIssueChatBindings({ ...enabled, hasCodexBinding: false }), false);
+  assert.equal(shouldPollIssueChatBindings({ ...enabled, isDocumentVisible: false }), false);
+});
+
+test("serializes polling and stops stale interval callbacks on cleanup", async () => {
+  const triggers = [];
+  let intervalCallback;
+  let resolveFirstRefresh;
+  let scheduledIntervals = 0;
+  let cancelledIntervals = 0;
+  let refreshCount = 0;
+
+  const scheduler = createIssueChatRefreshScheduler({
+    refresh: (trigger) => {
+      triggers.push(trigger);
+      refreshCount += 1;
+      if (refreshCount === 1) {
+        return new Promise((resolve) => {
+          resolveFirstRefresh = resolve;
+        });
+      }
+    },
+    scheduleInterval: (callback) => {
+      scheduledIntervals += 1;
+      intervalCallback = callback;
+      return scheduledIntervals;
+    },
+    cancelInterval: () => {
+      cancelledIntervals += 1;
+    },
+  });
+
+  scheduler.start();
+  scheduler.start();
+  assert.equal(scheduledIntervals, 1);
+
+  intervalCallback?.();
+  const coalescedRequest = scheduler.request("manual");
+  await Promise.resolve();
+  assert.deepEqual(triggers, ["interval"]);
+
+  intervalCallback?.();
+  await Promise.resolve();
+  assert.deepEqual(triggers, ["interval"]);
+
+  resolveFirstRefresh?.();
+  await coalescedRequest;
+  scheduler.stop();
+  assert.equal(cancelledIntervals, 1);
+
+  intervalCallback?.();
+  await Promise.resolve();
+  assert.deepEqual(triggers, ["interval"]);
+
+  await scheduler.request("manual");
+  assert.deepEqual(triggers, ["interval", "manual"]);
+});
+
+test("keeps polling after a rejected quiet refresh", async () => {
+  let refreshCount = 0;
+  const scheduler = createIssueChatRefreshScheduler({
+    refresh: async () => {
+      refreshCount += 1;
+      if (refreshCount === 1) throw new Error("transient");
+    },
+  });
+
+  await scheduler.request();
+  await scheduler.request();
+  assert.equal(refreshCount, 2);
 });

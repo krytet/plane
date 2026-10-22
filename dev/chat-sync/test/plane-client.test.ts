@@ -121,6 +121,32 @@ test("parses an existing manual binding with cursor zero and empty progress", as
   assert.deepEqual(bindings[0]?.progress, { done: [], now: [], waiting: [] });
 });
 
+test("normalizes a nullable link title to an empty string", async () => {
+  const fetchImpl = async () =>
+    new Response(
+      JSON.stringify([
+        {
+          id: "binding-null-title",
+          provider: "codex",
+          thread_id: TARGET.threadId,
+          sync_cursor: 0,
+          progress: {},
+          link: { url: TARGET.url, title: null },
+        },
+      ]),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  const client = new PlaneClient({
+    baseUrl: "https://plane.example.com",
+    apiKey: "test-api-key",
+    fetchImpl: fetchImpl as typeof fetch,
+  });
+
+  const bindings = await client.listBindings(TARGET);
+
+  assert.deepEqual(bindings[0]?.link, { url: TARGET.url, title: "" });
+});
+
 test("rejects partially initialized progress", async () => {
   const fetchImpl = async () =>
     new Response(

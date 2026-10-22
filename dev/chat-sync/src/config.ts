@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { ChatSyncError } from "./errors.ts";
 
 export type ChatProvider = "codex" | "chatgpt";
+export type ProgressMode = "status_block" | "structured_or_summary";
 
 export interface ThreadTarget {
   provider: ChatProvider;
@@ -21,6 +22,7 @@ export interface AdapterConfig {
   stateFile: string;
   pollIntervalSeconds: number;
   codexExecutable: string;
+  progressMode: ProgressMode;
   threads: ThreadTarget[];
 }
 
@@ -30,11 +32,15 @@ const TOP_LEVEL_KEYS = new Set([
   "stateFile",
   "pollIntervalSeconds",
   "codexExecutable",
+  "progressMode",
   "threads",
 ]);
 const THREAD_KEYS = new Set(["provider", "threadId", "workspaceSlug", "projectId", "issueId", "url", "title"]);
 const SECRET_KEY = /(?:api[_-]?key|secret|password|passwd|token)/i;
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CODEX_NATIVE_URL_RE =
+  /^codex:\/\/threads\/([0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const WORKSPACE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const PROVIDER_HOSTS = new Set(["chatgpt.com", "www.chatgpt.com", "chat.openai.com", "www.chat.openai.com"]);
 
@@ -86,6 +92,14 @@ export function normalizeProviderUrl(value: string): string {
   return url.toString();
 }
 
+function normalizeCodexNativeUrl(value: string, threadId: string): string {
+  const match = CODEX_NATIVE_URL_RE.exec(value.trim());
+  if (!match) invalid();
+  const normalizedThreadId = normalizeUuid(threadId.trim());
+  if (match[1]!.toLowerCase() !== normalizedThreadId) invalid();
+  return `codex://threads/${normalizedThreadId}`;
+}
+
 function parseThread(value: unknown): ThreadTarget {
   if (!isRecord(value)) invalid();
   assertKnownKeys(value, THREAD_KEYS);
@@ -105,6 +119,7 @@ function parseThread(value: unknown): ThreadTarget {
   ) {
     invalid();
   }
+  if (provider === "codex" && !UUID_V7_RE.test(threadId.trim())) invalid();
 
   const workspaceSlug = value.workspaceSlug;
   if (typeof workspaceSlug !== "string" || !WORKSPACE_RE.test(workspaceSlug)) invalid();
@@ -117,7 +132,10 @@ function parseThread(value: unknown): ThreadTarget {
 
   const rawUrl = value.url;
   if (typeof rawUrl !== "string" || rawUrl.length > 2_048) invalid();
-  const url = normalizeProviderUrl(rawUrl);
+  const url =
+    provider === "codex" && rawUrl.trim().toLowerCase().startsWith("codex:")
+      ? normalizeCodexNativeUrl(rawUrl, threadId)
+      : normalizeProviderUrl(rawUrl);
 
   const title = value.title;
   if (title !== undefined && (typeof title !== "string" || title.length > 255)) invalid();
@@ -160,6 +178,9 @@ export async function loadConfig(configPath: string): Promise<AdapterConfig> {
   const codexExecutable = raw.codexExecutable ?? "codex";
   if (typeof codexExecutable !== "string" || !codexExecutable.trim()) invalid();
 
+  const progressMode = raw.progressMode ?? "status_block";
+  if (progressMode !== "status_block" && progressMode !== "structured_or_summary") invalid();
+
   if (!Array.isArray(raw.threads) || raw.threads.length === 0 || raw.threads.length > 100) {
     invalid();
   }
@@ -181,6 +202,7 @@ export async function loadConfig(configPath: string): Promise<AdapterConfig> {
     stateFile,
     pollIntervalSeconds,
     codexExecutable,
+    progressMode,
     threads,
   };
 }

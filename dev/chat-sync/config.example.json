@@ -4,6 +4,7 @@
   "stateFile": "./state/cursors.json",
   "pollIntervalSeconds": 30,
   "codexExecutable": "codex",
+  "progressMode": "status_block",
   "threads": [
     {
       "provider": "codex",
@@ -11,7 +12,7 @@
       "workspaceSlug": "example-workspace",
       "projectId": "00000000-0000-4000-8000-000000000000",
       "issueId": "00000000-0000-4000-8000-000000000001",
-      "url": "https://chatgpt.com/codex/tasks/example",
+      "url": "codex://threads/01900000-0000-7000-8000-000000000000",
       "title": "Codex task"
     }
   ]

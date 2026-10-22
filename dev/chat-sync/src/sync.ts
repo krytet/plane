@@ -13,7 +13,7 @@ import {
   type PlanePayload,
   type SyncState,
 } from "./state.ts";
-import { getFinalAgentText, parseStatusBlock } from "./status-block.ts";
+import { getFinalAgentText, parseProgressFromFinalText } from "./status-block.ts";
 
 export interface SyncEvent {
   event: string;
@@ -219,6 +219,7 @@ async function syncTarget(
   reader: CodexReader,
   plane: PlaneClient,
   target: ThreadTarget,
+  progressMode: AdapterConfig["progressMode"],
   state: BindingState,
   saveState: () => Promise<void>,
   log: EventLogger
@@ -270,6 +271,9 @@ async function syncTarget(
     return logSkipped(log, target, "blocked", "reconciliation_conflict");
   }
 
+  const thread = await reader.readThread(target.threadId);
+  if (!thread) return logSkipped(log, target, "thread_not_found", "thread_not_found");
+
   const turns = await reader.listTurns(target.threadId);
   const newest = turns[0];
   if (!newest) return logSkipped(log, target, "no_turns");
@@ -302,7 +306,7 @@ async function syncTarget(
 
   let progress;
   try {
-    progress = parseStatusBlock(finalText);
+    progress = parseProgressFromFinalText(finalText, progressMode).progress;
   } catch (error) {
     state.lastObservedTurnId = newest.id;
     await saveState();
@@ -320,11 +324,13 @@ async function syncTarget(
   const floor = Math.max(state.cursor, remote?.sync_cursor ?? 0);
   state.cursor = floor;
   const cursor = nextCursor(floor, newest.completedAt);
+  const remoteLink = remote?.link;
+  const payloadTitle = remoteLink ? remoteLink.title?.trim() : target.title?.trim();
   const payload: PlanePayload = {
     provider: "codex",
     thread_id: normalizeUuid(target.threadId),
-    url: target.url,
-    ...(target.title ? { title: target.title } : {}),
+    url: remoteLink?.url.trim() || target.url,
+    ...(payloadTitle ? { title: payloadTitle } : {}),
     cursor,
     progress,
   };
@@ -421,21 +427,21 @@ export async function runCycle(
   assertSupportedProviders(config);
   const summary: CycleResult = { synced: 0, skipped: 0, errors: 0 };
   const targets = config.threads;
-  const found = await reader.findThreads(targets.map((target) => target.threadId));
 
   for (const target of targets) {
-    if (!found.has(target.threadId)) {
-      const result = logSkipped(log, target, "thread_not_found", "thread_not_found");
-      summary.skipped += result.skipped;
-      summary.errors += result.errors;
-      continue;
-    }
-
     try {
       // Targets are processed serially so one shared state file is updated in
       // a deterministic order.
       // oxlint-disable-next-line no-await-in-loop
-      const result = await syncTarget(reader, plane, target, getBindingState(state, target), saveState, log);
+      const result = await syncTarget(
+        reader,
+        plane,
+        target,
+        config.progressMode,
+        getBindingState(state, target),
+        saveState,
+        log
+      );
       summary.synced += result.synced;
       summary.skipped += result.skipped;
       summary.errors += result.errors;
@@ -450,6 +456,76 @@ export async function runCycle(
       if (
         error instanceof ChatSyncError &&
         ["plane_auth_failed", "protocol_incompatible", "app_server_failed", "cli_incompatible"].includes(error.code)
+      ) {
+        throw error;
+      }
+    }
+  }
+
+  return summary;
+}
+
+export async function runDryRunCycle(
+  reader: CodexReader,
+  config: AdapterConfig,
+  log: EventLogger = () => undefined
+): Promise<CycleResult> {
+  assertSupportedProviders(config);
+  const summary: CycleResult = { synced: 0, skipped: 0, errors: 0 };
+
+  for (const target of config.threads) {
+    try {
+      // Dry-run reads deliberately avoid Plane entirely.
+      // oxlint-disable-next-line no-await-in-loop
+      const thread = await reader.readThread(target.threadId);
+      if (!thread) {
+        const result = logSkipped(log, target, "thread_not_found", "thread_not_found");
+        summary.skipped += result.skipped;
+        summary.errors += result.errors;
+        continue;
+      }
+
+      // oxlint-disable-next-line no-await-in-loop
+      const turns = await reader.listTurns(target.threadId);
+      const newest = turns[0];
+      if (!newest) {
+        const result = logSkipped(log, target, "no_turns");
+        summary.skipped += result.skipped;
+        continue;
+      }
+      if (newest.status !== "completed" || newest.completedAt === null) {
+        const result = logSkipped(log, target, "latest_turn_not_completed");
+        summary.skipped += result.skipped;
+        continue;
+      }
+
+      const finalText = getFinalAgentText(newest.items);
+      if (!finalText) {
+        const result = logSkipped(log, target, "no_final_agent_message", "status_block_missing");
+        summary.skipped += result.skipped;
+        summary.errors += result.errors;
+        continue;
+      }
+
+      const parsed = parseProgressFromFinalText(finalText, config.progressMode);
+      log({
+        event: "dry_run_target",
+        threadId: target.threadId,
+        issueId: target.issueId,
+        code: parsed.source === "summary" ? "summary_available" : "structured_block",
+      });
+      summary.synced += 1;
+    } catch (error) {
+      log({
+        event: "target_failed",
+        threadId: target.threadId,
+        issueId: target.issueId,
+        code: codeForError(error),
+      });
+      summary.errors += 1;
+      if (
+        error instanceof ChatSyncError &&
+        ["protocol_incompatible", "app_server_failed", "cli_incompatible"].includes(error.code)
       ) {
         throw error;
       }

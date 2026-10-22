@@ -6,6 +6,8 @@ import tsconfigPaths from "vite-tsconfig-paths";
 
 dotenv.config({ path: path.resolve(__dirname, ".env") });
 
+const nativeApiProxyTarget = process.env.NATIVE_API_PROXY_TARGET;
+
 // Expose only vars starting with VITE_
 const viteEnv = Object.keys(process.env)
   .filter((k) => k.startsWith("VITE_"))
@@ -33,6 +35,18 @@ export default defineConfig(() => ({
   },
   server: {
     host: "127.0.0.1",
+    proxy: nativeApiProxyTarget
+      ? {
+          "/api": {
+            target: nativeApiProxyTarget,
+            changeOrigin: false,
+          },
+          "/auth": {
+            target: nativeApiProxyTarget,
+            changeOrigin: false,
+          },
+        }
+      : undefined,
   },
   // No SSR-specific overrides needed; alias resolves to ESM build
 }));

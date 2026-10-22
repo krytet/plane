@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/cli.ts",
-    "test": "node --test test/status-block.test.ts test/state.test.ts test/config.test.ts test/app-server.test.ts test/plane-client.test.ts test/adapter.test.ts"
+    "test": "node --test test/cli.test.ts test/status-block.test.ts test/state.test.ts test/config.test.ts test/app-server.test.ts test/plane-client.test.ts test/adapter.test.ts"
   },
   "engines": {
     "node": ">=22.22.0"

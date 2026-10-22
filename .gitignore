@@ -95,6 +95,7 @@ deploy/selfhost/plane-app/
 output.css
 
 dev-editor
+.local-native/
 # Redis
 *.rdb
 *.rdb.gz

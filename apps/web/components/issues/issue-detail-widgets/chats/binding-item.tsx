@@ -11,6 +11,7 @@ import { cn } from "@plane/utils";
 // local imports
 import {
   formatIssueChatObservationFreshness,
+  formatIssueChatProgressSyncFreshness,
   getCodexThreadDeepLink,
   getIssueChatManualAttentionAction,
   getIssueChatObservationSourceLabel,
@@ -84,7 +85,10 @@ export function IssueChatBindingItem(props: Props) {
             {!nativeCodexUrl && !webLink && <p className="text-body-sm-medium text-secondary">Chat link unavailable</p>}
           </div>
         </div>
-        <p className="text-11 text-tertiary">{formatIssueChatObservationFreshness(binding.observation_observed_at)}</p>
+        <div className="space-y-1 text-right text-11 text-tertiary">
+          <p>{formatIssueChatObservationFreshness(binding.observation_observed_at)}</p>
+          <p>{formatIssueChatProgressSyncFreshness(binding.last_synced_at, hasProgress)}</p>
+        </div>
       </div>
 
       <div className="flex flex-wrap items-center gap-2">

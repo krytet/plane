@@ -94,7 +94,7 @@ export class Server {
 
   public listen() {
     this.httpServer = this.app
-      .listen(this.app.get("port"), () => {
+      .listen({ port: this.app.get("port"), host: env.HOST }, () => {
         logger.info(`SERVER: Express server has started at port ${this.app.get("port")}`);
       })
       .on("error", (err) => {

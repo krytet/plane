@@ -12,11 +12,12 @@ import type {
   PlaneWriteResult,
 } from "../src/plane-client.ts";
 import type { PlanePayload, SyncState } from "../src/state.ts";
-import { runCycle } from "../src/sync.ts";
+import { runCycle, runDryRunCycle } from "../src/sync.ts";
 
+const THREAD_ID = "01900000-0000-7000-8000-000000000000";
 const TARGET: ThreadTarget = {
   provider: "codex",
-  threadId: "thread-1",
+  threadId: THREAD_ID,
   workspaceSlug: "workspace",
   projectId: "00000000-0000-4000-8000-000000000000",
   issueId: "00000000-0000-4000-8000-000000000001",
@@ -30,8 +31,10 @@ const CONFIG: AdapterConfig = {
   stateFile: "unused",
   pollIntervalSeconds: 30,
   codexExecutable: "codex",
+  progressMode: "status_block",
   threads: [TARGET],
 };
+const STATE_KEY = `codex:${THREAD_ID}:workspace:00000000-0000-4000-8000-000000000000:00000000-0000-4000-8000-000000000001`;
 
 const FINAL_MESSAGE = [
   "Arbitrary final prose that must not be forwarded.",
@@ -58,16 +61,16 @@ function completedTurn(id = "turn-1", text = FINAL_MESSAGE): CodexTurn {
 }
 
 class FakeReader implements CodexReader {
-  threads = new Set(["thread-1"]);
+  threads = new Set([THREAD_ID]);
   turns: CodexTurn[] = [completedTurn()];
   listCalls = 0;
-  findCalls = 0;
+  readCalls = 0;
 
   async initialize(): Promise<void> {}
 
-  async findThreads(ids: string[]) {
-    this.findCalls += 1;
-    return new Map(ids.filter((id) => this.threads.has(id)).map((id) => [id, { id, modelProvider: "openai" }]));
+  async readThread(id: string) {
+    this.readCalls += 1;
+    return this.threads.has(id) ? { id, modelProvider: "openai", status: { type: "notLoaded" as const } } : null;
   }
 
   async listTurns(): Promise<CodexTurn[]> {
@@ -250,6 +253,60 @@ test("updates an existing cursor-zero binding and posts the completed observatio
   assert.equal(plane.observations[0]?.observation.observed_at, new Date(1_800_000_000 * 1_000).toISOString());
 });
 
+test("uses freshly fetched binding URL and title instead of the config snapshot", async () => {
+  const reader = new FakeReader();
+  const plane = new FakePlane();
+  plane.remote = {
+    ...manualBinding(),
+    link: {
+      url: "https://chatgpt.com/codex/tasks/human-metadata",
+      title: "Human-maintained title",
+    },
+  };
+
+  await runCycle(reader, plane as unknown as PlaneClient, CONFIG, initialState(), save);
+
+  assert.equal(plane.posts[0]?.url, "https://chatgpt.com/codex/tasks/human-metadata");
+  assert.equal(plane.posts[0]?.title, "Human-maintained title");
+});
+
+test("reconciles a pending write before treating a disappeared thread as missing", async () => {
+  const reader = new FakeReader();
+  reader.threads.clear();
+  const plane = new FakePlane();
+  const payload: PlanePayload = {
+    provider: "codex",
+    thread_id: THREAD_ID,
+    url: TARGET.url,
+    title: TARGET.title,
+    cursor: 1_800_000_001,
+    progress: {
+      done: ["Previously posted"],
+      now: [],
+      waiting: [],
+    },
+  };
+  plane.remote = asBinding(payload);
+  const state = initialState();
+  state.bindings[STATE_KEY] = {
+    cursor: 0,
+    pending: {
+      cursor: payload.cursor,
+      turnId: "turn-pending",
+      payloadHash: "pending-hash",
+      payload,
+    },
+  };
+
+  const result = await runCycle(reader, plane as unknown as PlaneClient, CONFIG, state, save);
+
+  assert.equal(result.synced, 1);
+  assert.equal(result.errors, 0);
+  assert.equal(reader.readCalls, 0);
+  assert.equal(plane.gets, 1);
+  assert.equal(state.bindings[STATE_KEY]?.pending, undefined);
+});
+
 test("does not post a completed turn without a status block", async () => {
   const reader = new FakeReader();
   reader.turns = [completedTurn("turn-2", "Only arbitrary prose.")];
@@ -261,11 +318,7 @@ test("does not post a completed turn without a status block", async () => {
   assert.equal(plane.posts.length, 0);
   assert.equal(plane.observations.length, 0);
   assert.equal(plane.gets, 0);
-  assert.equal(
-    state.bindings["codex:thread-1:workspace:00000000-0000-4000-8000-000000000000:00000000-0000-4000-8000-000000000001"]
-      ?.lastObservedTurnId,
-    "turn-2"
-  );
+  assert.equal(state.bindings[STATE_KEY]?.lastObservedTurnId, "turn-2");
 });
 
 test("reconciles an uncertain write with GET instead of blindly retrying", async () => {
@@ -281,11 +334,7 @@ test("reconciles an uncertain write with GET instead of blindly retrying", async
   assert.equal(plane.gets, 2);
   assert.equal(plane.observations.length, 1);
   assert.equal(result.synced, 1);
-  assert.equal(
-    state.bindings["codex:thread-1:workspace:00000000-0000-4000-8000-000000000000:00000000-0000-4000-8000-000000000001"]
-      ?.pending,
-    undefined
-  );
+  assert.equal(state.bindings[STATE_KEY]?.pending, undefined);
 });
 
 test("keeps a committed progress write when the follow-up observation is rejected", async () => {
@@ -300,11 +349,7 @@ test("keeps a committed progress write when the follow-up observation is rejecte
   assert.equal(plane.observations.length, 1);
   assert.equal(result.synced, 1);
   assert.equal(result.errors, 1);
-  assert.equal(
-    state.bindings["codex:thread-1:workspace:00000000-0000-4000-8000-000000000000:00000000-0000-4000-8000-000000000001"]
-      ?.pending,
-    undefined
-  );
+  assert.equal(state.bindings[STATE_KEY]?.pending, undefined);
 });
 
 test("reconciles before retrying a completed observation on the next cycle", async () => {
@@ -367,6 +412,58 @@ test("reports ChatGPT before starting any read", async () => {
     runCycle(reader, plane as unknown as PlaneClient, config, initialState(), async () => undefined),
     (error: unknown) => error instanceof ChatSyncError && error.code === "unsupported_provider"
   );
-  assert.equal(reader.findCalls, 0);
+  assert.equal(reader.readCalls, 0);
   assert.equal(plane.gets, 0);
+});
+
+test("keeps missing threads isolated so peer targets still sync", async () => {
+  const reader = new FakeReader();
+  const plane = new FakePlane();
+  const missingTarget: ThreadTarget = {
+    ...TARGET,
+    threadId: "01900000-0000-7000-8000-000000000002",
+    issueId: "00000000-0000-4000-8000-000000000002",
+  };
+  const config: AdapterConfig = { ...CONFIG, threads: [TARGET, missingTarget] };
+
+  const result = await runCycle(reader, plane as unknown as PlaneClient, config, initialState(), save);
+
+  assert.equal(result.synced, 1);
+  assert.equal(result.skipped, 1);
+  assert.equal(result.errors, 1);
+  assert.equal(plane.posts.length, 1);
+});
+
+test("structured-or-summary syncs an ordinary answer without claiming task completion", async () => {
+  const reader = new FakeReader();
+  reader.turns = [
+    completedTurn(
+      "turn-summary",
+      "The endpoint is implemented and focused tests pass. Review [the diff](https://example.test/private) before rollout."
+    ),
+  ];
+  const plane = new FakePlane();
+  const config: AdapterConfig = { ...CONFIG, progressMode: "structured_or_summary" };
+
+  const result = await runCycle(reader, plane as unknown as PlaneClient, config, initialState(), save);
+
+  assert.equal(result.synced, 1);
+  assert.equal(plane.posts.length, 1);
+  assert.deepEqual(plane.posts[0]?.progress.done, []);
+  assert.match(plane.posts[0]?.progress.now[0] ?? "", /^Последний ответ Codex \(кратко\):/);
+  assert.doesNotMatch(plane.posts[0]?.progress.now.join(" ") ?? "", /https?:\/\//);
+});
+
+test("dry-run reads and classifies an answer without any Plane access", async () => {
+  const reader = new FakeReader();
+  reader.turns = [completedTurn("turn-summary", "A safe ordinary answer for the local probe.")];
+  const config: AdapterConfig = { ...CONFIG, progressMode: "structured_or_summary" };
+  const events: Array<{ event: string; code?: string }> = [];
+
+  const result = await runDryRunCycle(reader, config, (event) => events.push(event));
+
+  assert.equal(result.synced, 1);
+  assert.equal(events[0]?.event, "dry_run_target");
+  assert.equal(events[0]?.code, "summary_available");
+  assert.doesNotMatch(JSON.stringify(events), /safe ordinary answer/);
 });

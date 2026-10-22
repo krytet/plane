@@ -7,7 +7,7 @@ import { assertSupportedProviders, loadConfig } from "./config.ts";
 import { ChatSyncError, codeForError } from "./errors.ts";
 import { PlaneClient } from "./plane-client.ts";
 import { StateStore } from "./state.ts";
-import { runCycle, type SyncEvent } from "./sync.ts";
+import { runCycle, runDryRunCycle, type SyncEvent } from "./sync.ts";
 
 function writeEvent(event: SyncEvent): void {
   process.stdout.write(`${JSON.stringify({ time: new Date().toISOString(), ...event })}\n`);
@@ -15,10 +15,11 @@ function writeEvent(event: SyncEvent): void {
 
 function usage(): string {
   return [
-    "Usage: node src/cli.ts --config <path> [--once]",
+    "Usage: node src/cli.ts --config <path> [--once] [--dry-run]",
     "",
     "  --config <path>  JSON config file; defaults to CHAT_SYNC_CONFIG",
     "  --once           Run one polling cycle",
+    "  --dry-run        Read and summarize Codex only; no Plane requests or state writes",
     "  --help           Show this help",
   ].join("\n");
 }
@@ -28,6 +29,7 @@ async function main(): Promise<void> {
     options: {
       config: { type: "string" },
       once: { type: "boolean", default: false },
+      "dry-run": { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     strict: true,
@@ -52,6 +54,46 @@ async function main(): Promise<void> {
 
   assertSupportedProviders(config);
   await assertSupportedCodexVersion(config.codexExecutable);
+
+  if (args.values["dry-run"]) {
+    const reader = new CodexAppServerClient({ executable: config.codexExecutable });
+    const stopController = new AbortController();
+    const stop = () => stopController.abort();
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+
+    try {
+      await reader.initialize();
+      let firstCycle = true;
+      while (!stopController.signal.aborted) {
+        if (!firstCycle) {
+          try {
+            // oxlint-disable-next-line no-await-in-loop
+            await delay(config.pollIntervalSeconds * 1_000, undefined, {
+              signal: stopController.signal,
+            });
+          } catch {
+            break;
+          }
+        }
+        firstCycle = false;
+
+        // oxlint-disable-next-line no-await-in-loop
+        const result = await runDryRunCycle(reader, config, writeEvent);
+        writeEvent({
+          event: "cycle_complete",
+          code: result.errors > 0 ? "completed_with_errors" : undefined,
+        });
+        process.exitCode = result.errors > 0 ? 1 : 0;
+        if (args.values.once) break;
+      }
+    } finally {
+      process.removeListener("SIGINT", stop);
+      process.removeListener("SIGTERM", stop);
+      await reader.close();
+    }
+    return;
+  }
 
   const apiKey = process.env.PLANE_API_KEY;
   if (!apiKey) {

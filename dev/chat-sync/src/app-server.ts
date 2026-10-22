@@ -3,15 +3,17 @@ import { createInterface } from "node:readline";
 
 import { ChatSyncError } from "./errors.ts";
 
-// Keep this null until a live, matching Desktop/app-server protocol has been
-// verified and this adapter's tests are updated for that exact schema.
-export const VERIFIED_CODEX_PROTOCOL_VERSION: string | null = null;
+export const VERIFIED_CODEX_PROTOCOL_VERSION = "0.163.0-alpha.11";
 
 type SpawnLike = typeof spawn;
 
 export interface CodexThreadSummary {
   id: string;
   modelProvider: string;
+  status: {
+    type: "notLoaded" | "idle" | "systemError" | "active";
+    activeFlags?: string[];
+  };
 }
 
 export interface CodexTurnItem {
@@ -29,23 +31,32 @@ export interface CodexTurn {
 
 export interface CodexReader {
   initialize(): Promise<void>;
-  findThreads(threadIds: string[]): Promise<Map<string, CodexThreadSummary>>;
+  readThread(threadId: string): Promise<CodexThreadSummary | null>;
   listTurns(threadId: string): Promise<CodexTurn[]>;
   close(): Promise<void>;
 }
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
-  reject: (error: ChatSyncError) => void;
+  reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+}
+
+class AppServerRpcError extends Error {
+  readonly rpcCode: number;
+
+  constructor(rpcCode: number) {
+    super("app_server_rpc_error");
+    this.name = "AppServerRpcError";
+    this.rpcCode = rpcCode;
+  }
 }
 
 interface AppServerOptions {
   executable?: string;
   spawnImpl?: SpawnLike;
   requestTimeoutMs?: number;
-  threadPageLimit?: number;
-  threadPageMax?: number;
+  closeTimeoutMs?: number;
   turnLimit?: number;
 }
 
@@ -55,9 +66,28 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function codexChildEnvironment(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toUpperCase() !== "PLANE_API_KEY"));
+}
+
+function detachOwnedProcess(child: ChildProcessWithoutNullStreams): void {
+  for (const stream of [child.stdin, child.stdout, child.stderr]) {
+    try {
+      stream.destroy();
+    } catch {
+      // Only this adapter's pipe handles are being released.
+    }
+  }
+  try {
+    child.unref();
+  } catch {
+    // The child may already be detached or exited.
+  }
+}
+
 export function parseCodexVersion(output: string): string {
   const match = /^codex-cli\s+(\S+)\s*$/.exec(output.trim());
-  if (!match || VERIFIED_CODEX_PROTOCOL_VERSION === null || match[1] !== VERIFIED_CODEX_PROTOCOL_VERSION) {
+  if (!match || match[1] !== VERIFIED_CODEX_PROTOCOL_VERSION) {
     throw new ChatSyncError("cli_incompatible");
   }
   return match[1];
@@ -73,10 +103,20 @@ export async function assertSupportedCodexVersion(
       shell: false,
       windowsHide: true,
       stdio: ["ignore", "pipe", "ignore"],
+      env: codexChildEnvironment(),
     });
     let output = "";
     const timer = setTimeout(() => {
-      child.kill();
+      try {
+        child.stdout?.destroy();
+      } catch {
+        // Release only this version-check child's pipe.
+      }
+      try {
+        child.unref();
+      } catch {
+        // The child may already have exited.
+      }
       reject(new ChatSyncError("cli_incompatible"));
     }, timeoutMs);
 
@@ -106,8 +146,7 @@ export class CodexAppServerClient implements CodexReader {
   private readonly executable: string;
   private readonly spawnImpl: SpawnLike;
   private readonly requestTimeoutMs: number;
-  private readonly threadPageLimit: number;
-  private readonly threadPageMax: number;
+  private readonly closeTimeoutMs: number;
   private readonly turnLimit: number;
   private child: ChildProcessWithoutNullStreams | null = null;
   private nextRequestId = 1;
@@ -118,9 +157,8 @@ export class CodexAppServerClient implements CodexReader {
     this.executable = options.executable ?? "codex";
     this.spawnImpl = options.spawnImpl ?? spawn;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
-    this.threadPageLimit = options.threadPageLimit ?? 100;
-    this.threadPageMax = options.threadPageMax ?? 20;
-    this.turnLimit = options.turnLimit ?? 20;
+    this.closeTimeoutMs = options.closeTimeoutMs ?? 500;
+    this.turnLimit = options.turnLimit ?? 1;
   }
 
   private failProtocol(): never {
@@ -183,7 +221,11 @@ export class CodexAppServerClient implements CodexReader {
     clearTimeout(pending.timer);
 
     if (message.error !== undefined) {
-      pending.reject(new ChatSyncError("app_server_failed"));
+      if (!isRecord(message.error) || typeof message.error.code !== "number") {
+        pending.reject(new ChatSyncError("protocol_incompatible"));
+        return;
+      }
+      pending.reject(new AppServerRpcError(message.error.code));
       return;
     }
     if (!("result" in message)) {
@@ -199,6 +241,7 @@ export class CodexAppServerClient implements CodexReader {
       shell: false,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
+      env: codexChildEnvironment(),
     });
     this.child = child;
     this.closed = false;
@@ -252,44 +295,48 @@ export class CodexAppServerClient implements CodexReader {
     this.send({ method: "initialized", params: {} });
   }
 
-  async findThreads(threadIds: string[]): Promise<Map<string, CodexThreadSummary>> {
-    const remaining = new Set(threadIds);
-    const found = new Map<string, CodexThreadSummary>();
-    let cursor: string | null = null;
-
-    for (let page = 0; page < this.threadPageMax && remaining.size > 0; page += 1) {
-      // Pagination is intentionally sequential because each cursor depends on
-      // the previous response.
-      // oxlint-disable-next-line no-await-in-loop
-      const result = await this.request("thread/list", {
-        cursor,
-        limit: this.threadPageLimit,
-        sortKey: "updated_at",
-        sortDirection: "desc",
-        sourceKinds: ["cli", "vscode", "subAgent"],
-        useStateDbOnly: true,
-      });
-      if (!isRecord(result) || !Array.isArray(result.data)) this.failProtocol();
-
-      for (const value of result.data) {
-        if (
-          !isRecord(value) ||
-          typeof value.id !== "string" ||
-          typeof value.modelProvider !== "string" ||
-          !isRecord(value.status)
-        ) {
-          this.failProtocol();
-        }
-        if (remaining.delete(value.id)) {
-          found.set(value.id, { id: value.id, modelProvider: value.modelProvider });
-        }
-      }
-
-      cursor = typeof result.nextCursor === "string" && result.nextCursor ? result.nextCursor : null;
-      if (!cursor) break;
+  async readThread(threadId: string): Promise<CodexThreadSummary | null> {
+    let result: unknown;
+    try {
+      result = await this.request("thread/read", { threadId });
+    } catch (error) {
+      // -32600 is generic, so map it to absence only for this exact validated
+      // thread/read method and parameter shape.
+      if (error instanceof AppServerRpcError && error.rpcCode === -32600) return null;
+      if (error instanceof ChatSyncError) throw error;
+      throw new ChatSyncError("app_server_failed");
     }
 
-    return found;
+    if (!isRecord(result) || !isRecord(result.thread) || !isRecord(result.readState)) {
+      this.failProtocol();
+    }
+    const thread = result.thread;
+    if (
+      typeof thread.id !== "string" ||
+      thread.id.toLowerCase() !== threadId.toLowerCase() ||
+      typeof thread.modelProvider !== "string" ||
+      !thread.modelProvider ||
+      !isRecord(thread.status) ||
+      !["notLoaded", "idle", "systemError", "active"].includes(String(thread.status.type))
+    ) {
+      this.failProtocol();
+    }
+    if (
+      thread.status.type === "active" &&
+      (!Array.isArray(thread.status.activeFlags) ||
+        !thread.status.activeFlags.every((flag) => typeof flag === "string"))
+    ) {
+      this.failProtocol();
+    }
+
+    return {
+      id: thread.id.toLowerCase(),
+      modelProvider: thread.modelProvider,
+      status: {
+        type: thread.status.type as CodexThreadSummary["status"]["type"],
+        ...(thread.status.type === "active" ? { activeFlags: thread.status.activeFlags as string[] } : {}),
+      },
+    };
   }
 
   async listTurns(threadId: string): Promise<CodexTurn[]> {
@@ -297,7 +344,7 @@ export class CodexAppServerClient implements CodexReader {
       threadId,
       limit: this.turnLimit,
       sortDirection: "desc",
-      itemsView: "full",
+      itemsView: "summary",
     });
     if (!isRecord(result) || !Array.isArray(result.data)) this.failProtocol();
 
@@ -348,9 +395,9 @@ export class CodexAppServerClient implements CodexReader {
         resolve();
       };
       const timer = setTimeout(() => {
-        child.kill();
+        detachOwnedProcess(child);
         finish();
-      }, 500);
+      }, this.closeTimeoutMs);
       child.once("close", () => {
         clearTimeout(timer);
         finish();
