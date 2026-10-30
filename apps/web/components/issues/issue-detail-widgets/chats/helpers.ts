@@ -37,6 +37,16 @@ const PROVIDER_HOSTS: Record<TIssueChatProvider, Set<string>> = {
 const LOCAL_DEBUG_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CODEX_NATIVE_URL_PREFIX = "codex://threads/";
+const T3_CODE_NATIVE_HOST = "threads";
+const T3_CODE_HOSTED_ORIGIN = "https://app.t3.codes";
+const T3_CODE_LINK_MESSAGE =
+  "T3 Code links must use t3code://threads/<environment_id>/<thread_id> or https://app.t3.codes/<environment_id>/<thread_id>.";
+
+const hasUnsafeT3CodeSegmentCharacter = (value: string): boolean =>
+  Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return character === "/" || character === "\\" || character.trim() === "" || codePoint < 0x20 || codePoint === 0x7f;
+  });
 
 export const getIssueChatProviderLabel = (provider: TIssueChatProvider): string =>
   PROVIDER_LABELS[provider] ?? provider;
@@ -126,6 +136,60 @@ export const getCodexThreadDeepLink = (threadId: string): string | undefined => 
   const normalizedThreadId = threadId.trim();
   if (!UUID_RE.test(normalizedThreadId)) return undefined;
   return `${CODEX_NATIVE_URL_PREFIX}${normalizedThreadId.toLowerCase()}`;
+};
+
+const getT3CodePathError = (pathname: string): string | undefined => {
+  const segments = pathname.replace(/^\/+|\/+$/g, "").split("/");
+  if (segments.length !== 2) return "T3 Code links require exactly an environment ID and thread ID.";
+  for (const segment of segments) {
+    if (!segment || segment === "." || segment === "..") {
+      return "T3 Code links require exactly an environment ID and thread ID.";
+    }
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      return T3_CODE_LINK_MESSAGE;
+    }
+    if (decoded.length > 512 || hasUnsafeT3CodeSegmentCharacter(decoded)) {
+      return "T3 Code links require exactly an environment ID and thread ID.";
+    }
+  }
+  return undefined;
+};
+
+export const getIssueChatT3UrlValidationError = (value: string): string | undefined => {
+  const normalized = value.trim();
+  if (!normalized) return undefined;
+
+  try {
+    const url = new URL(normalized);
+    if (url.username || url.password) return "T3 Code links cannot contain credentials.";
+    if (url.search || url.hash) return "T3 Code links cannot contain query parameters or fragments.";
+
+    if (url.protocol === "t3code:") {
+      if (url.hostname !== T3_CODE_NATIVE_HOST || url.port) return T3_CODE_LINK_MESSAGE;
+      return getT3CodePathError(url.pathname);
+    }
+
+    if (
+      url.protocol === "https:" &&
+      url.hostname === "app.t3.codes" &&
+      (!url.port || url.port === "443") &&
+      url.origin === T3_CODE_HOSTED_ORIGIN
+    ) {
+      return getT3CodePathError(url.pathname);
+    }
+
+    return T3_CODE_LINK_MESSAGE;
+  } catch {
+    return T3_CODE_LINK_MESSAGE;
+  }
+};
+
+export const getSafeT3CodeLink = (value: string | null | undefined): string | undefined => {
+  if (!value || getIssueChatT3UrlValidationError(value)) return undefined;
+  return value.trim();
 };
 
 export const getIssueChatUrlValidationError = (value: string, provider: TIssueChatProvider): string | undefined => {

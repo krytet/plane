@@ -204,6 +204,72 @@ def test_app_route_accepts_only_matching_native_codex_urls_and_keeps_chatgpt_htt
 
 @pytest.mark.contract
 @pytest.mark.django_db
+def test_app_route_stores_updates_and_clears_a_t3_code_link(tenant):
+    thread_id = str(uuid4())
+    t3_url = f"t3code://threads/environment-1/{thread_id}"
+    payload = {
+        "provider": "codex",
+        "thread_id": thread_id,
+        "t3_url": t3_url,
+    }
+
+    response = tenant["client"].post(_url(tenant["workspace"], tenant["issue"]), payload, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED, response.content
+    binding = IssueChatBinding.objects.get(pk=response.data["id"])
+    assert binding.t3_url == t3_url
+    assert binding.link.url == f"codex://threads/{thread_id}"
+    assert response.data["t3_url"] == t3_url
+
+    hosted_url = f"https://app.t3.codes/environment-1/{thread_id}"
+    updated = tenant["client"].post(
+        _url(tenant["workspace"], tenant["issue"]),
+        {**payload, "t3_url": hosted_url},
+        format="json",
+    )
+
+    assert updated.status_code == status.HTTP_200_OK, updated.content
+    binding.refresh_from_db()
+    assert binding.t3_url == hosted_url
+    assert updated.data["t3_url"] == hosted_url
+
+    cleared = tenant["client"].post(
+        _url(tenant["workspace"], tenant["issue"]),
+        {**payload, "t3_url": ""},
+        format="json",
+    )
+
+    assert cleared.status_code == status.HTTP_200_OK, cleared.content
+    binding.refresh_from_db()
+    assert binding.t3_url == ""
+    assert cleared.data["t3_url"] == ""
+
+    listed = tenant["client"].get(_url(tenant["workspace"], tenant["issue"]))
+    assert listed.status_code == status.HTTP_200_OK, listed.content
+    assert listed.data[0]["t3_url"] == ""
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_app_route_rejects_an_invalid_t3_code_link(tenant):
+    thread_id = str(uuid4())
+    response = tenant["client"].post(
+        _url(tenant["workspace"], tenant["issue"]),
+        {
+            "provider": "codex",
+            "thread_id": thread_id,
+            "t3_url": f"https://app.t3.codes/threads/environment-1/{thread_id}",
+        },
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "t3_url" in response.data
+    assert not IssueChatBinding.objects.filter(issue=tenant["issue"]).exists()
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
 def test_app_route_uses_session_auth_and_does_not_accept_api_keys(tenant):
     token = APIToken.objects.create(user=tenant["owner"], label=f"token-{uuid4().hex[:8]}")
     api_key_client = APIClient()

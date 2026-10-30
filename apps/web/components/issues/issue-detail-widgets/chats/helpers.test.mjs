@@ -12,9 +12,11 @@ import {
   getIssueChatPlaneReadLabel,
   getCodexThreadDeepLink,
   getIssueChatBindingUrlValidationError,
+  getIssueChatT3UrlValidationError,
   getIssueChatUrlValidationError,
   getIssueChatProviderLabel,
   getSafeIssueChatWebLink,
+  getSafeT3CodeLink,
   isCurrentIssueChatRefreshLifecycle,
   isValidIssueChatUrl,
   shouldApplyIssueChatRefresh,
@@ -107,6 +109,34 @@ test("builds and validates only exact native Codex thread deep links", () => {
     getSafeIssueChatWebLink("https://chatgpt.com/codex/tasks/example"),
     "https://chatgpt.com/codex/tasks/example"
   );
+});
+
+test("accepts only exact T3 Code native and hosted thread links", () => {
+  const environmentId = "environment-1";
+  const threadId = "import:codex:01900000-0000-7000-8000-000000000000";
+  const nativeUrl = `t3code://threads/${environmentId}/${threadId}`;
+  const hostedUrl = `https://app.t3.codes/${environmentId}/${threadId}`;
+
+  assert.equal(getIssueChatT3UrlValidationError(""), undefined);
+  assert.equal(getIssueChatT3UrlValidationError(nativeUrl), undefined);
+  assert.equal(getIssueChatT3UrlValidationError(hostedUrl), undefined);
+  assert.equal(getSafeT3CodeLink(nativeUrl), nativeUrl);
+  assert.equal(getSafeT3CodeLink(hostedUrl), hostedUrl);
+
+  for (const value of [
+    `https://app.t3.codes/threads/${environmentId}/${threadId}`,
+    `http://app.t3.codes/${environmentId}/${threadId}`,
+    `https://app.t3.codes.evil.example/${environmentId}/${threadId}`,
+    `t3code://app/${environmentId}/${threadId}`,
+    `t3code://threads/${environmentId}`,
+    `t3code://threads/${environmentId}/${threadId}/extra`,
+    `${nativeUrl}?prompt=test`,
+    `${hostedUrl}#fragment`,
+    `https://user:token@app.t3.codes/${environmentId}/${threadId}`,
+  ]) {
+    assert.notEqual(getIssueChatT3UrlValidationError(value), undefined);
+    assert.equal(getSafeT3CodeLink(value), undefined);
+  }
 });
 
 test("rejects stale refresh results after identity, request, or mutation changes", () => {

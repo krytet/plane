@@ -8,7 +8,7 @@ import re
 from copy import deepcopy
 from dataclasses import dataclass
 from html import escape
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 from uuid import UUID
 
 from bs4 import BeautifulSoup
@@ -37,6 +37,13 @@ CHAT_PROGRESS_JSON_TYPE = "chatProgress"
 PROGRESS_BLOCK_ID_PREFIX = "plane-chat-progress-"
 PROGRESS_KEYS = ("done", "now", "waiting")
 CODEX_NATIVE_URL_PREFIX = "codex://threads/"
+T3_CODE_NATIVE_URL_PREFIX = "t3code://threads/"
+T3_CODE_HOSTED_ORIGIN = "https://app.t3.codes"
+T3_CODE_URL_MAX_LENGTH = 2048
+T3_CODE_LINK_MESSAGE = (
+    "T3 Code links must use t3code://threads/<environment_id>/<thread_id> "
+    "or https://app.t3.codes/<environment_id>/<thread_id>."
+)
 PROVIDER_HOSTS = {
     IssueChatBinding.Provider.CODEX: frozenset(
         {"chatgpt.com", "www.chatgpt.com", "chat.openai.com", "www.chat.openai.com"}
@@ -256,6 +263,68 @@ def codex_thread_deep_link(thread_id):
     if canonical_thread_id is None:
         return None
     return f"{CODEX_NATIVE_URL_PREFIX}{canonical_thread_id}"
+
+
+def _normalize_t3_path_segment(segment):
+    decoded = unquote(segment)
+    if (
+        not decoded
+        or decoded in {".", ".."}
+        or len(decoded) > 512
+        or any(
+            character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F or character in "/\\"
+            for character in decoded
+        )
+    ):
+        raise IssueChatInputError("t3_url", "T3 Code links require exactly an environment ID and thread ID.")
+    return quote(decoded, safe=":@!$&'()*+,;=-._~")
+
+
+def normalize_t3_code_url(value):
+    """Validate and canonicalize an optional T3 Code thread link."""
+
+    if value is None:
+        return None
+
+    normalized = str(value).strip()
+    if not normalized:
+        return ""
+    if len(normalized) > T3_CODE_URL_MAX_LENGTH:
+        raise IssueChatInputError("t3_url", "The T3 Code link is too long.")
+
+    try:
+        parts = urlsplit(normalized)
+        port = parts.port
+    except ValueError as exc:
+        raise IssueChatInputError("t3_url", T3_CODE_LINK_MESSAGE) from exc
+
+    if parts.username or parts.password or parts.query or parts.fragment:
+        raise IssueChatInputError(
+            "t3_url",
+            "T3 Code links cannot contain credentials, query parameters, or fragments.",
+        )
+
+    if parts.scheme.lower() == "t3code":
+        if (parts.netloc or "").lower() != "threads" or port is not None:
+            raise IssueChatInputError("t3_url", T3_CODE_LINK_MESSAGE)
+        base_url = T3_CODE_NATIVE_URL_PREFIX.rstrip("/")
+    elif parts.scheme.lower() in {"http", "https"}:
+        hostname = (parts.hostname or "").rstrip(".").lower()
+        if parts.scheme.lower() != "https" or hostname != "app.t3.codes" or port not in (None, 443):
+            raise IssueChatInputError("t3_url", T3_CODE_LINK_MESSAGE)
+        base_url = T3_CODE_HOSTED_ORIGIN
+    else:
+        raise IssueChatInputError("t3_url", T3_CODE_LINK_MESSAGE)
+
+    segments = parts.path.strip("/").split("/")
+    if len(segments) != 2:
+        raise IssueChatInputError("t3_url", "T3 Code links require exactly an environment ID and thread ID.")
+
+    environment_id, thread_id = (_normalize_t3_path_segment(segment) for segment in segments)
+    canonical_url = f"{base_url}/{environment_id}/{thread_id}"
+    if len(canonical_url) > T3_CODE_URL_MAX_LENGTH:
+        raise IssueChatInputError("t3_url", "The T3 Code link is too long.")
+    return canonical_url
 
 
 def normalize_chat_binding_url(provider, thread_id, value):
@@ -1041,7 +1110,7 @@ def _ensure_chat_link(binding, issue, actor, provider, thread_id, requested_url,
     return link
 
 
-def _create_binding(issue, actor, provider, thread_id):
+def _create_binding(issue, actor, provider, thread_id, t3_url=""):
     try:
         with transaction.atomic():
             return IssueChatBinding.objects.create(
@@ -1050,6 +1119,7 @@ def _create_binding(issue, actor, provider, thread_id):
                 issue=issue,
                 provider=provider,
                 thread_id=thread_id,
+                t3_url=t3_url,
                 created_by_id=actor.id,
                 progress={},
             )
@@ -1070,11 +1140,13 @@ def create_issue_chat_binding(
     thread_id,
     url=None,
     title=None,
+    t3_url=None,
 ):
     """Create or return a manual binding without inventing sync state."""
 
     normalized_thread_id, requested_url = _normalize_binding_identity(provider, thread_id, url)
     requested_title = _normalize_item(title) if title else None
+    normalized_t3_url = normalize_t3_code_url(t3_url)
 
     try:
         with transaction.atomic():
@@ -1102,7 +1174,13 @@ def create_issue_chat_binding(
             if created:
                 if requested_url is None:
                     raise IssueChatInputError("url", "url is required when creating a chat binding.")
-                binding = _create_binding(issue, actor, provider, normalized_thread_id)
+                binding = _create_binding(
+                    issue,
+                    actor,
+                    provider,
+                    normalized_thread_id,
+                    t3_url=normalized_t3_url or "",
+                )
             elif binding.issue_id != issue.id:
                 raise IssueChatConflict(
                     "thread_already_bound",
@@ -1120,7 +1198,14 @@ def create_issue_chat_binding(
             )
             if binding.link_id != link.id:
                 binding.link = link
-                binding.save(update_fields=["link", "updated_at"])
+                binding_updates = ["link"]
+            else:
+                binding_updates = []
+            if normalized_t3_url is not None and binding.t3_url != normalized_t3_url:
+                binding.t3_url = normalized_t3_url
+                binding_updates.append("t3_url")
+            if binding_updates:
+                binding.save(update_fields=[*binding_updates, "updated_at"])
     except IntegrityError as exc:
         raise IssueChatConflict(
             "thread_already_bound",

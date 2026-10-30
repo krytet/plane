@@ -14,6 +14,7 @@ from plane.utils.issue_chat import (
     merge_progress_block,
     normalize_chat_binding_url,
     normalize_provider_url,
+    normalize_t3_code_url,
     progress_block_hash,
     progress_block_id,
     redact_issue_activity_fields,
@@ -170,6 +171,38 @@ def test_native_codex_url_is_synthesized_only_for_a_matching_uuid_thread():
         normalize_chat_binding_url("chatgpt", thread_id, None)
     with pytest.raises(IssueChatInputError):
         normalize_chat_binding_url("chatgpt", thread_id, native_url)
+
+
+@pytest.mark.unit
+def test_t3_code_links_accept_only_native_or_hosted_thread_links():
+    thread_id = str(uuid4())
+    native_url = f"t3code://threads/environment-1/{thread_id}"
+    hosted_url = f"https://app.t3.codes/environment-1/{thread_id}"
+
+    assert normalize_t3_code_url(None) is None
+    assert normalize_t3_code_url("") == ""
+    assert normalize_t3_code_url(f" {native_url} ") == native_url
+    assert normalize_t3_code_url(f"{native_url}/") == native_url
+    assert normalize_t3_code_url(hosted_url) == hosted_url
+    assert normalize_t3_code_url(f"{hosted_url}/") == hosted_url
+    assert normalize_t3_code_url(f"https://app.t3.codes:443/environment-1/{thread_id}") == hosted_url
+
+    for value in (
+        f"https://app.t3.codes/threads/environment-1/{thread_id}",
+        f"http://app.t3.codes/environment-1/{thread_id}",
+        f"https://app.t3.codes.evil.example/environment-1/{thread_id}",
+        f"t3code://app/environment-1/{thread_id}",
+        f"t3code://threads/environment-1/{thread_id}/extra",
+        "t3code://threads/environment-1",
+        "t3code://threads/environment-1/..",
+        f"t3code://threads/environment-1/{thread_id}?prompt=test",
+        f"t3code://threads/environment-1/{thread_id}#fragment",
+        f"t3code://threads:443/environment-1/{thread_id}",
+        f"https://user:token@app.t3.codes/environment-1/{thread_id}",
+        f"https://app.t3.codes:8443/environment-1/{thread_id}",
+    ):
+        with pytest.raises(IssueChatInputError):
+            normalize_t3_code_url(value)
 
 
 @pytest.mark.unit

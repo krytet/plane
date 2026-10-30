@@ -8,9 +8,13 @@ import { useState } from "react";
 import { Button } from "@makeplane/propel/components/button";
 import { InputField } from "@makeplane/propel/components/input-field";
 import { Select, SelectContent, SelectItem, SelectList, SelectTrigger } from "@makeplane/propel/components/select";
-import type { TIssueChatBindingCreate, TIssueChatProvider } from "@plane/types";
+import type { TIssueChatBinding, TIssueChatBindingCreate, TIssueChatProvider } from "@plane/types";
 // local imports
-import { getCodexThreadDeepLink, getIssueChatBindingUrlValidationError } from "./helpers";
+import {
+  getCodexThreadDeepLink,
+  getIssueChatBindingUrlValidationError,
+  getIssueChatT3UrlValidationError,
+} from "./helpers";
 
 const PROVIDER_OPTIONS: { label: string; value: TIssueChatProvider }[] = [
   { label: "Codex", value: "codex" },
@@ -20,16 +24,19 @@ const PROVIDER_OPTIONS: { label: string; value: TIssueChatProvider }[] = [
 type Props = {
   isSubmitting: boolean;
   error?: string;
+  initialBinding?: TIssueChatBinding;
   onCancel: () => void;
   onSubmit: (data: TIssueChatBindingCreate) => Promise<void>;
 };
 
 export function IssueChatBindingAddForm(props: Props) {
-  const { isSubmitting, error, onCancel, onSubmit } = props;
-  const [provider, setProvider] = useState<TIssueChatProvider>("codex");
-  const [url, setUrl] = useState("");
-  const [threadId, setThreadId] = useState("");
-  const [title, setTitle] = useState("");
+  const { isSubmitting, error, initialBinding, onCancel, onSubmit } = props;
+  const isEditing = initialBinding !== undefined;
+  const [provider, setProvider] = useState<TIssueChatProvider>(initialBinding?.provider ?? "codex");
+  const [url, setUrl] = useState(initialBinding?.link?.url ?? "");
+  const [threadId, setThreadId] = useState(initialBinding?.thread_id ?? "");
+  const [title, setTitle] = useState(initialBinding?.link?.title ?? "");
+  const [t3Url, setT3Url] = useState(initialBinding?.t3_url ?? "");
   const [validationError, setValidationError] = useState<string>();
   const nativeCodexUrl = provider === "codex" ? getCodexThreadDeepLink(threadId) : undefined;
 
@@ -40,6 +47,7 @@ export function IssueChatBindingAddForm(props: Props) {
     const normalizedUrl = url.trim();
     const normalizedThreadId = threadId.trim();
     const normalizedTitle = title.trim();
+    const normalizedT3Url = t3Url.trim();
 
     if (!normalizedThreadId) {
       setValidationError("Thread ID is required.");
@@ -50,21 +58,29 @@ export function IssueChatBindingAddForm(props: Props) {
       setValidationError(urlError);
       return;
     }
+    const t3UrlError = getIssueChatT3UrlValidationError(normalizedT3Url);
+    if (t3UrlError) {
+      setValidationError(t3UrlError);
+      return;
+    }
 
-    await onSubmit({
+    const data: TIssueChatBindingCreate = {
       provider,
       thread_id: normalizedThreadId,
       ...(normalizedUrl ? { url: normalizedUrl } : {}),
       ...(normalizedTitle ? { title: normalizedTitle } : {}),
-    });
+      ...(normalizedT3Url ? { t3_url: normalizedT3Url } : isEditing ? { t3_url: "" } : {}),
+    };
+    await onSubmit(data);
   };
 
   return (
     <form onSubmit={handleSubmit} className="space-y-3 rounded-md border border-subtle bg-surface-2 p-3">
       <div className="space-y-1">
-        <p className="text-body-sm-medium">Add a chat binding</p>
+        <p className="text-body-sm-medium">{isEditing ? "Edit chat links" : "Add a chat binding"}</p>
         <p className="text-11 text-tertiary">
-          Binding stores a chat link and identifiers. It does not sync or start a chat automatically.
+          Binding stores Codex/ChatGPT identifiers and an optional T3 Code link. It does not sync or start a chat
+          automatically.
         </p>
       </div>
 
@@ -79,7 +95,7 @@ export function IssueChatBindingAddForm(props: Props) {
             onValueChange={(value) => {
               if (value) setProvider(value);
             }}
-            disabled={isSubmitting}
+            disabled={isSubmitting || isEditing}
           >
             <SelectTrigger id="chat-binding-provider" size="md" />
             <SelectContent side="bottom" align="start">
@@ -101,14 +117,14 @@ export function IssueChatBindingAddForm(props: Props) {
           value={threadId}
           onChange={(event) => setThreadId(event.target.value)}
           placeholder="Provider thread identifier or Codex UUID"
-          disabled={isSubmitting}
+          disabled={isSubmitting || isEditing}
           maxLength={255}
           required
         />
 
         <InputField
           id="chat-binding-url"
-          type="url"
+          type="text"
           size="md"
           orientation="vertical"
           label="URL"
@@ -118,6 +134,20 @@ export function IssueChatBindingAddForm(props: Props) {
           hint={nativeCodexUrl ? "Optional for a local Codex UUID; blank uses the native link." : "Required"}
           disabled={isSubmitting}
           required={!nativeCodexUrl}
+        />
+
+        <InputField
+          id="chat-binding-t3-url"
+          type="text"
+          size="md"
+          orientation="vertical"
+          label="T3 Code link"
+          value={t3Url}
+          onChange={(event) => setT3Url(event.target.value)}
+          placeholder="t3code://threads/<environment>/<thread>"
+          hint="Optional. Use the T3 Code thread link for the same chat."
+          disabled={isSubmitting}
+          maxLength={2048}
         />
 
         <InputField
@@ -151,7 +181,14 @@ export function IssueChatBindingAddForm(props: Props) {
           disabled={isSubmitting}
           onClick={onCancel}
         />
-        <Button type="submit" variant="primary" size="sm" stretch="auto" label="Add binding" loading={isSubmitting} />
+        <Button
+          type="submit"
+          variant="primary"
+          size="sm"
+          stretch="auto"
+          label={isEditing ? "Save binding" : "Add binding"}
+          loading={isSubmitting}
+        />
       </div>
     </form>
   );

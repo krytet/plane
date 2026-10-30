@@ -26,6 +26,7 @@ export type TIssueChatBinding = {
   link: TIssueLink | null;
   provider: TIssueChatProvider;
   thread_id: string;
+  t3_url: string;
   sync_cursor: number;
   progress: TIssueChatProgress;
   last_synced_at: string | null;
@@ -53,6 +54,7 @@ export type TIssueChatBindingCreate = {
   url?: string;
   thread_id: string;
   title?: string;
+  t3_url?: string;
 };
 
 export type TIssueChatBindingResponse = TIssueChatBinding & {

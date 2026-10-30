@@ -19,6 +19,7 @@ import {
   getIssueChatPlaneReadLabel,
   getIssueChatProviderLabel,
   getSafeIssueChatWebLink,
+  getSafeT3CodeLink,
 } from "./helpers";
 
 type Props = {
@@ -28,6 +29,7 @@ type Props = {
   pendingAction?: "seen" | "manual_attention";
   onMarkSeen: () => Promise<void>;
   onManualAttention: (value: TIssueChatManualAttention) => Promise<void>;
+  onEdit: () => void;
 };
 
 const PROGRESS_GROUPS: { key: keyof TIssueChatProgress; label: string }[] = [
@@ -37,8 +39,9 @@ const PROGRESS_GROUPS: { key: keyof TIssueChatProgress; label: string }[] = [
 ];
 
 export function IssueChatBindingItem(props: Props) {
-  const { binding, disabled, actionError, pendingAction, onMarkSeen, onManualAttention } = props;
+  const { binding, disabled, actionError, pendingAction, onMarkSeen, onManualAttention, onEdit } = props;
   const nativeCodexUrl = binding.provider === "codex" ? getCodexThreadDeepLink(binding.thread_id) : undefined;
+  const t3CodeLink = getSafeT3CodeLink(binding.t3_url);
   const webLink = getSafeIssueChatWebLink(binding.link?.url);
   const webLinkLabel = binding.link?.title?.trim() || webLink || "Chat link unavailable";
   const stateLabel = getIssueChatObservationStateLabel(binding.observation_state);
@@ -82,7 +85,31 @@ export function IssueChatBindingItem(props: Props) {
                 <NewTabOutline className="size-3 shrink-0" />
               </a>
             )}
-            {!nativeCodexUrl && !webLink && <p className="text-body-sm-medium text-secondary">Chat link unavailable</p>}
+            {t3CodeLink && (
+              <a
+                href={t3CodeLink}
+                target={t3CodeLink.startsWith("t3code:") ? undefined : "_blank"}
+                rel={t3CodeLink.startsWith("t3code:") ? undefined : "noopener noreferrer"}
+                className="group flex min-w-0 items-center gap-1.5 text-body-sm-medium text-secondary hover:text-accent-primary"
+                aria-label="Open this chat in T3 Code"
+              >
+                <span className="truncate">Open in T3 Code</span>
+                <NewTabOutline className="size-3 shrink-0" />
+              </a>
+            )}
+            {!disabled && (
+              <button
+                type="button"
+                className="text-11 font-medium text-secondary hover:text-primary"
+                disabled={!!pendingAction}
+                onClick={onEdit}
+              >
+                {t3CodeLink ? "Edit links" : "Add T3 Code link"}
+              </button>
+            )}
+            {!nativeCodexUrl && !webLink && !t3CodeLink && (
+              <p className="text-body-sm-medium text-secondary">Chat link unavailable</p>
+            )}
           </div>
         </div>
         <div className="space-y-1 text-right text-11 text-tertiary">

@@ -410,6 +410,7 @@ class IssueChatBinding(ProjectBaseModel):
     )
     provider = models.CharField(max_length=20, choices=Provider.choices)
     thread_id = models.CharField(max_length=255)
+    t3_url = models.CharField(max_length=2048, blank=True, default="")
     sync_cursor = models.PositiveBigIntegerField(default=0)
     progress = models.JSONField(default=dict)
     payload_hash = models.CharField(max_length=64, blank=True, default="")
