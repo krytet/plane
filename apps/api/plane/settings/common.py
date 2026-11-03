@@ -30,6 +30,15 @@ _logger = logging.getLogger("plane")
 # Secret Key — use `or` so an explicitly empty env var is treated the same as unset,
 # falling back to a random key rather than passing "" to Django (GHSA-cmwv-pjmw-8483).
 SECRET_KEY = os.environ.get("SECRET_KEY") or get_random_secret_key()
+
+# Jira synchronization is opt-in. Only explicitly configured Jira Cloud hosts
+# may receive personal credentials from this instance.
+JIRA_ALLOWED_HOSTS = [
+    host.strip().lower().rstrip(".")
+    for host in os.environ.get("JIRA_ALLOWED_HOSTS", "atlassian.net").split(",")
+    if host.strip()
+]
+JIRA_CREDENTIAL_ENCRYPTION_KEY = os.environ.get("JIRA_CREDENTIAL_ENCRYPTION_KEY", "")
 # Refuse to run silently with a publicly-known or placeholder SECRET_KEY
 # (GHSA-cmwv-pjmw-8483). Emit a critical log so operators notice immediately.
 # The `or get_random_secret_key()` above means the only way to reach this branch

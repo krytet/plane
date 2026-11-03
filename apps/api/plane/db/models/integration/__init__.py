@@ -10,3 +10,18 @@ from .github import (
     GithubCommentSync,
 )
 from .slack import SlackProjectSync
+from .jira import (
+    JiraAuthType,
+    JiraAutomationConsent,
+    JiraCredentialHealth,
+    JiraDraft,
+    JiraIssueBinding,
+    JiraOperation,
+    JiraOperationKind,
+    JiraOperationState,
+    JiraProjectPolicy,
+    JiraSiteRegistration,
+    JiraSyncDirection,
+    JiraSyncEvent,
+    JiraUserGrant,
+)
