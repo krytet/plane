@@ -7,7 +7,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('db', '0129_jira_integration'),
+        ('db', '0133_jira_integration'),
     ]
 
     operations = [

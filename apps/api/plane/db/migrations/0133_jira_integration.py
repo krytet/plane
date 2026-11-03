@@ -9,7 +9,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('db', '0128_issue_chat_workflow'),
+        ('db', '0129_issue_chat_binding_t3_url'),
     ]
 
     operations = [
