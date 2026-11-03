@@ -616,9 +616,12 @@ DEV-09 — AC45; DEV-01/04 — AC46. Входящий и system-event sync не�
 и не считать OAuth acceptance уже пройденным.
 
 Проверено в этой ветке: `manage.py check`, отсутствие неприменённых миграций,
-18 backend-тестов (unit + contract), `pnpm check:types`, production build
+19 Jira backend-тестов (unit + contract), `pnpm check:types`, production build
 frontend и Playwright-сценарий: открыть настройки Jira, сохранить policy,
 открыть issue, открыть формы Link/Create и получить draft. В base Plane shell
+полный backend suite завершился `1327 passed / 18 failed`; падения относятся
+к существующим SMTP/magic-link, intake activity и issue-link проверкам,
+а не к Jira-модулю. В Jira subset — `19 passed`. В base Plane shell
 во время локального статического preview наблюдаются существующие 404
 `intake-state` и React hydration warning; они не относятся к Jira endpoints.
 Живые Jira/GitHub credentials не использовались.
