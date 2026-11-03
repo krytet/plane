@@ -62,6 +62,7 @@ from plane.db.models import (
     ProjectMember,
     UserRecentVisit,
 )
+from plane.utils.exception_logger import log_exception
 from plane.utils.filters import ComplexFilterBackend, IssueFilterSet
 from plane.utils.global_paginator import paginate
 from plane.utils.grouper import (
@@ -718,6 +719,7 @@ class IssueViewSet(BaseViewSet):
 
         serializer = IssueCreateSerializer(issue, data=request.data, partial=True, context={"project_id": project_id})
         if serializer.is_valid():
+            previous_state_id = issue.state_id
             merged_description = None
             merged_description_json = None
             try:
@@ -764,6 +766,17 @@ class IssueViewSet(BaseViewSet):
             is_migration_description_update = skip_activity and is_description_update
             # Log all the updates
             if not is_migration_description_update:
+                if previous_state_id != issue.state_id:
+                    try:
+                        from plane.utils.jira_integration.sync import queue_state_change
+
+                        operation = queue_state_change(issue=issue, actor=request.user, origin="human")
+                        if operation is not None:
+                            from plane.bgtasks.jira_sync_task import dispatch_jira_operation
+
+                            dispatch_jira_operation.delay(str(operation.id))
+                    except Exception as exc:
+                        log_exception(exc)
                 issue_activity.delay(
                     type="issue.activity.updated",
                     requested_data=json.dumps(accepted_data, cls=DjangoJSONEncoder),
