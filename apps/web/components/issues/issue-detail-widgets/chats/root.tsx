@@ -75,6 +75,7 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
   const [loadError, setLoadError] = useState<string>();
   const [refreshError, setRefreshError] = useState<string>();
   const [isFormOpen, setIsFormOpen] = useState(false);
+  const [editingBindingId, setEditingBindingId] = useState<string>();
   const [pendingAction, setPendingAction] = useState<{
     bindingId: string;
     action: "seen" | "manual_attention";
@@ -82,6 +83,7 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
   const [actionErrors, setActionErrors] = useState<Record<string, string>>({});
   const isCollapsibleOpen = openWidgets.includes("chats");
   const hasCodexBinding = bindings.some((binding) => binding.provider === "codex");
+  const editingBinding = editingBindingId ? bindings.find((binding) => binding.id === editingBindingId) : undefined;
 
   const loadBindings = useCallback(
     async (mode: "initial" | "silent" | "manual" = "silent") => {
@@ -151,6 +153,7 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
     setFormError(undefined);
     setRefreshError(undefined);
     setIsFormOpen(false);
+    setEditingBindingId(undefined);
     setIsSubmitting(false);
     setIsRefreshing(false);
     void loadBindings("initial");
@@ -159,6 +162,13 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
       requestSequenceRef.current += 1;
     };
   }, [loadBindings]);
+
+  useEffect(() => {
+    if (editingBindingId && !bindings.some((binding) => binding.id === editingBindingId)) {
+      setEditingBindingId(undefined);
+      setIsFormOpen(false);
+    }
+  }, [bindings, editingBindingId]);
 
   const refreshBindings = useCallback(
     (trigger: "interval" | "focus" | "manual") => loadBindings(trigger === "manual" ? "manual" : "silent"),
@@ -230,6 +240,7 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
       if (!isMountedRef.current || identityRef.current !== mutationIdentity) return;
       setBindings((current) => [binding, ...current.filter((item) => item.id !== binding.id)]);
       setIsFormOpen(false);
+      setEditingBindingId(undefined);
     } catch (error) {
       if (!isMountedRef.current || identityRef.current !== mutationIdentity) return;
       setFormError(getErrorMessage(error));
@@ -317,6 +328,12 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
     else void loadBindings("manual");
   };
 
+  const handleEdit = (binding: TIssueChatBinding) => {
+    setFormError(undefined);
+    setEditingBindingId(binding.id);
+    setIsFormOpen(true);
+  };
+
   return (
     <Collapsible
       open={isCollapsibleOpen}
@@ -353,6 +370,7 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
                   event.preventDefault();
                   event.stopPropagation();
                   setFormError(undefined);
+                  setEditingBindingId(undefined);
                   setIsFormOpen((current) => !current);
                 }}
               >
@@ -366,10 +384,13 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
       <div className="space-y-3">
         {isFormOpen && (
           <IssueChatBindingAddForm
+            key={editingBinding?.id ?? "new"}
             isSubmitting={isSubmitting}
             error={formError}
+            initialBinding={editingBinding}
             onCancel={() => {
               setFormError(undefined);
+              setEditingBindingId(undefined);
               setIsFormOpen(false);
             }}
             onSubmit={handleCreate}
@@ -406,11 +427,12 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
               pendingAction={pendingAction?.bindingId === binding.id ? pendingAction.action : undefined}
               onMarkSeen={() => handleMarkSeen(binding.id)}
               onManualAttention={(value) => handleManualAttention(binding.id, value)}
+              onEdit={() => handleEdit(binding)}
             />
           ))
         ) : (
           <p className="text-11 text-tertiary">
-            No chat bindings yet. Add a web link, or use a Codex thread UUID for a local deep link.
+            No chat bindings yet. Add a web link, a Codex thread UUID, and optionally a T3 Code link.
           </p>
         )}
       </div>

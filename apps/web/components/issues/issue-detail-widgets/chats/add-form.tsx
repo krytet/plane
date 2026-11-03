@@ -8,9 +8,16 @@ import { useState } from "react";
 import { Button } from "@makeplane/propel/components/button";
 import { InputField } from "@makeplane/propel/components/input-field";
 import { Select, SelectContent, SelectItem, SelectList, SelectTrigger } from "@makeplane/propel/components/select";
-import type { TIssueChatBindingCreate, TIssueChatProvider } from "@plane/types";
+import type { TIssueChatBinding, TIssueChatBindingCreate, TIssueChatProvider } from "@plane/types";
 // local imports
-import { getCodexThreadDeepLink, getIssueChatBindingUrlValidationError } from "./helpers";
+import {
+  getCodexThreadDeepLink,
+  getIssueChatBindingUrlValidationError,
+  getIssueChatT3UrlValidationError,
+  parseT3CodeThreadLink,
+  parseT3ThreadInput,
+  type TParsedT3CodeThreadLink,
+} from "./helpers";
 
 const PROVIDER_OPTIONS: { label: string; value: TIssueChatProvider }[] = [
   { label: "Codex", value: "codex" },
@@ -20,18 +27,62 @@ const PROVIDER_OPTIONS: { label: string; value: TIssueChatProvider }[] = [
 type Props = {
   isSubmitting: boolean;
   error?: string;
+  initialBinding?: TIssueChatBinding;
   onCancel: () => void;
   onSubmit: (data: TIssueChatBindingCreate) => Promise<void>;
 };
 
 export function IssueChatBindingAddForm(props: Props) {
-  const { isSubmitting, error, onCancel, onSubmit } = props;
-  const [provider, setProvider] = useState<TIssueChatProvider>("codex");
-  const [url, setUrl] = useState("");
-  const [threadId, setThreadId] = useState("");
-  const [title, setTitle] = useState("");
+  const { isSubmitting, error, initialBinding, onCancel, onSubmit } = props;
+  const isEditing = initialBinding !== undefined;
+  const [provider, setProvider] = useState<TIssueChatProvider>(initialBinding?.provider ?? "codex");
+  const [url, setUrl] = useState(initialBinding?.link?.url ?? "");
+  const [threadId, setThreadId] = useState(initialBinding?.thread_id ?? "");
+  const [title, setTitle] = useState(initialBinding?.link?.title ?? "");
+  const [t3Url, setT3Url] = useState(initialBinding?.t3_url ?? "");
+  const [pasteValue, setPasteValue] = useState("");
+  const [pasteNotice, setPasteNotice] = useState<string>();
   const [validationError, setValidationError] = useState<string>();
   const nativeCodexUrl = provider === "codex" ? getCodexThreadDeepLink(threadId) : undefined;
+  const parsedT3Link = parseT3CodeThreadLink(t3Url);
+
+  const applyT3Reference = (reference: TParsedT3CodeThreadLink) => {
+    setProvider("codex");
+    if (reference.codexThreadId) setThreadId(reference.codexThreadId);
+    setT3Url(reference.url);
+    if (reference.title) setTitle(reference.title);
+    setValidationError(undefined);
+    setPasteNotice(
+      reference.codexThreadId
+        ? "Codex thread ID and T3 Code link filled."
+        : "T3 Code link filled, but it does not include a Codex thread ID."
+    );
+  };
+
+  const handlePasteValueChange = (nextValue: string) => {
+    setPasteValue(nextValue);
+    const parsed = parseT3ThreadInput(nextValue);
+    if (!parsed) {
+      setPasteNotice(undefined);
+      return;
+    }
+    if (parsed.kind === "codex") {
+      setProvider("codex");
+      setThreadId(parsed.codexThreadId);
+      setValidationError(undefined);
+      setPasteNotice("Codex thread ID filled.");
+      return;
+    }
+    if (parsed.kind === "t3") {
+      applyT3Reference(parsed.reference);
+      return;
+    }
+    if (parsed.codexThreadId) {
+      setProvider("codex");
+      setThreadId(parsed.codexThreadId);
+    }
+    setPasteNotice("This is a T3 context link, not a thread link. Use Copy thread in T3, then paste the new link.");
+  };
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -40,6 +91,7 @@ export function IssueChatBindingAddForm(props: Props) {
     const normalizedUrl = url.trim();
     const normalizedThreadId = threadId.trim();
     const normalizedTitle = title.trim();
+    const normalizedT3Url = t3Url.trim();
 
     if (!normalizedThreadId) {
       setValidationError("Thread ID is required.");
@@ -50,23 +102,59 @@ export function IssueChatBindingAddForm(props: Props) {
       setValidationError(urlError);
       return;
     }
+    if (normalizedT3Url.includes("t3-context:")) {
+      setValidationError(
+        "This is a T3 context link, not a thread link. Use Copy thread in T3, then paste the new link."
+      );
+      return;
+    }
+    const t3UrlError = getIssueChatT3UrlValidationError(normalizedT3Url);
+    if (t3UrlError) {
+      setValidationError(t3UrlError);
+      return;
+    }
+    const currentT3Link = parseT3CodeThreadLink(normalizedT3Url);
+    if (
+      currentT3Link?.codexThreadId &&
+      currentT3Link.codexThreadId.toLowerCase() !== normalizedThreadId.toLowerCase()
+    ) {
+      setValidationError("The T3 Code link belongs to a different Codex thread.");
+      return;
+    }
 
-    await onSubmit({
+    const data: TIssueChatBindingCreate = {
       provider,
       thread_id: normalizedThreadId,
       ...(normalizedUrl ? { url: normalizedUrl } : {}),
       ...(normalizedTitle ? { title: normalizedTitle } : {}),
-    });
+      ...(normalizedT3Url ? { t3_url: normalizedT3Url } : isEditing ? { t3_url: "" } : {}),
+    };
+    await onSubmit(data);
   };
 
   return (
     <form onSubmit={handleSubmit} className="space-y-3 rounded-md border border-subtle bg-surface-2 p-3">
       <div className="space-y-1">
-        <p className="text-body-sm-medium">Add a chat binding</p>
+        <p className="text-body-sm-medium">{isEditing ? "Edit chat links" : "Add a chat binding"}</p>
         <p className="text-11 text-tertiary">
-          Binding stores a chat link and identifiers. It does not sync or start a chat automatically.
+          Binding stores Codex/ChatGPT identifiers and an optional T3 Code link. It does not sync or start a chat
+          automatically.
         </p>
       </div>
+
+      <InputField
+        id="chat-binding-t3-paste"
+        type="text"
+        size="md"
+        orientation="vertical"
+        label="Paste from T3"
+        value={pasteValue}
+        onChange={(event) => handlePasteValueChange(event.target.value)}
+        placeholder="Copy thread in T3, then paste the link here"
+        hint="Accepts a T3 thread link, a legacy T3 context link, or a Codex UUID."
+        disabled={isSubmitting}
+      />
+      {pasteNotice && <p className="text-11 text-tertiary">{pasteNotice}</p>}
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div className="space-y-1">
@@ -79,7 +167,7 @@ export function IssueChatBindingAddForm(props: Props) {
             onValueChange={(value) => {
               if (value) setProvider(value);
             }}
-            disabled={isSubmitting}
+            disabled={isSubmitting || isEditing}
           >
             <SelectTrigger id="chat-binding-provider" size="md" />
             <SelectContent side="bottom" align="start">
@@ -99,16 +187,30 @@ export function IssueChatBindingAddForm(props: Props) {
           orientation="vertical"
           label="Thread ID"
           value={threadId}
-          onChange={(event) => setThreadId(event.target.value)}
-          placeholder="Provider thread identifier or Codex UUID"
-          disabled={isSubmitting}
+          onChange={(event) => {
+            const nextValue = event.target.value;
+            const parsed = parseT3ThreadInput(nextValue);
+            if (parsed?.kind === "t3") {
+              setPasteValue(nextValue);
+              applyT3Reference(parsed.reference);
+              return;
+            }
+            if (parsed?.kind === "context") {
+              setPasteValue(nextValue);
+              handlePasteValueChange(nextValue);
+              return;
+            }
+            setThreadId(nextValue);
+          }}
+          placeholder="Codex UUID, or paste a T3 thread link"
+          disabled={isSubmitting || isEditing}
           maxLength={255}
           required
         />
 
         <InputField
           id="chat-binding-url"
-          type="url"
+          type="text"
           size="md"
           orientation="vertical"
           label="URL"
@@ -118,6 +220,25 @@ export function IssueChatBindingAddForm(props: Props) {
           hint={nativeCodexUrl ? "Optional for a local Codex UUID; blank uses the native link." : "Required"}
           disabled={isSubmitting}
           required={!nativeCodexUrl}
+        />
+
+        <InputField
+          id="chat-binding-t3-url"
+          type="text"
+          size="md"
+          orientation="vertical"
+          label="T3 Code link"
+          value={t3Url}
+          onChange={(event) => {
+            const nextValue = event.target.value;
+            setT3Url(nextValue);
+            const parsed = parseT3CodeThreadLink(nextValue);
+            if (parsed) applyT3Reference(parsed);
+          }}
+          placeholder="t3code://threads/<environment>/<thread>?codexThreadId=<uuid>"
+          hint="Optional. Paste a T3 thread link; its Codex ID fills automatically."
+          disabled={isSubmitting}
+          maxLength={2048}
         />
 
         <InputField
@@ -135,6 +256,13 @@ export function IssueChatBindingAddForm(props: Props) {
         />
       </div>
 
+      {parsedT3Link && (
+        <p className="text-11 text-tertiary">
+          Codex {parsedT3Link.codexThreadId ?? "not included"} · T3 {parsedT3Link.threadId} · env{" "}
+          {parsedT3Link.environmentId}
+        </p>
+      )}
+
       {(validationError || error) && (
         <p role="alert" className="text-11 text-danger-primary">
           {validationError ?? error}
@@ -151,7 +279,14 @@ export function IssueChatBindingAddForm(props: Props) {
           disabled={isSubmitting}
           onClick={onCancel}
         />
-        <Button type="submit" variant="primary" size="sm" stretch="auto" label="Add binding" loading={isSubmitting} />
+        <Button
+          type="submit"
+          variant="primary"
+          size="sm"
+          stretch="auto"
+          label={isEditing ? "Save binding" : "Add binding"}
+          loading={isSubmitting}
+        />
       </div>
     </form>
   );

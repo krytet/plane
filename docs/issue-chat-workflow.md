@@ -4,6 +4,32 @@ This server-side integration moves a work item between configured workflow
 states based on typed Codex chat observations. It is disabled by default and is
 scoped to one explicitly configured project at a time.
 
+## Chat links
+
+A binding can expose two destinations for the same conversation:
+
+| Destination | Source                                    | Stored value                                                          |
+| ----------- | ----------------------------------------- | --------------------------------------------------------------------- |
+| Codex       | Synthesized from a Codex UUID `thread_id` | `codex://threads/<codex-thread-id>`                                   |
+| T3 Code     | Optional link entered on the binding      | `t3_url`, for example `t3code://threads/<environment-id>/<thread-id>` |
+
+T3 Code uses its own thread and environment identifiers, so its link cannot be
+derived from the Codex UUID. The hosted form
+`https://app.t3.codes/<environment-id>/<thread-id>` is also accepted. A T3 Code
+link is metadata only: it does not change the binding provider or start a
+chat. Use `Edit links` on an existing binding to add, replace, or clear it.
+
+`Copy thread` in T3 Code copies a deep link that carries the native Codex ID:
+
+```text
+t3code://threads/<environment-id>/<thread-id>?codexThreadId=<codex-uuid>&title=<title>
+```
+
+Paste that link into `Paste from T3` in Plane. Plane fills the Codex thread ID,
+T3 thread ID, T3 link, and title. A legacy `t3-context://v1/thread/...` value is
+a composer context reference, not a thread deep link; Plane reports it instead
+of silently binding a broken link.
+
 ## State contract
 
 | Mapping             | Required group      | Purpose                                              |

@@ -10,6 +10,7 @@ from plane.utils.issue_chat import (
     binding_is_unread,
     get_current_user_seen,
     normalize_chat_binding_url,
+    normalize_t3_code_url,
 )
 
 from .base import BaseSerializer
@@ -71,6 +72,11 @@ class IssueChatBindingCreateSerializer(serializers.Serializer):
     thread_id = serializers.CharField(max_length=255, trim_whitespace=True)
     url = serializers.CharField(max_length=2048, required=False, allow_blank=False)
     title = serializers.CharField(max_length=255, trim_whitespace=True, required=False, allow_blank=True)
+    t3_url = serializers.CharField(
+        max_length=2048,
+        required=False,
+        allow_blank=True,
+    )
 
     def validate_thread_id(self, value):
         if not value:
@@ -85,6 +91,8 @@ class IssueChatBindingCreateSerializer(serializers.Serializer):
                 attrs["thread_id"],
                 attrs.get("url"),
             )
+            if "t3_url" in attrs:
+                attrs["t3_url"] = normalize_t3_code_url(attrs["t3_url"])
         except IssueChatInputError as exc:
             raise serializers.ValidationError({exc.field: exc.message}) from exc
         return attrs
@@ -129,6 +137,7 @@ class IssueChatBindingSerializer(BaseSerializer):
             "link",
             "provider",
             "thread_id",
+            "t3_url",
             "sync_cursor",
             "progress",
             "last_synced_at",

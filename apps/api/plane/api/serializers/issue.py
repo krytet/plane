@@ -649,6 +649,7 @@ class IssueChatBindingSerializer(BaseSerializer):
             "link",
             "provider",
             "thread_id",
+            "t3_url",
             "sync_cursor",
             "progress",
             "last_synced_at",
