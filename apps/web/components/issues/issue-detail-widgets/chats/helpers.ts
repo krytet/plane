@@ -39,6 +39,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const CODEX_NATIVE_URL_PREFIX = "codex://threads/";
 const T3_CODE_NATIVE_HOST = "threads";
 const T3_CODE_HOSTED_ORIGIN = "https://app.t3.codes";
+const T3_CODE_QUERY_PARAMS = new Set(["codexThreadId", "title"]);
 const T3_CODE_LINK_MESSAGE =
   "T3 Code links must use t3code://threads/<environment_id>/<thread_id> or https://app.t3.codes/<environment_id>/<thread_id>.";
 
@@ -165,10 +166,12 @@ export const getIssueChatT3UrlValidationError = (value: string): string | undefi
   try {
     const url = new URL(normalized);
     if (url.username || url.password) return "T3 Code links cannot contain credentials.";
-    if (url.search || url.hash) return "T3 Code links cannot contain query parameters or fragments.";
+    if (url.hash) return "T3 Code links cannot contain fragments.";
 
     if (url.protocol === "t3code:") {
       if (url.hostname !== T3_CODE_NATIVE_HOST || url.port) return T3_CODE_LINK_MESSAGE;
+      const queryError = getT3CodeQueryError(url);
+      if (queryError) return queryError;
       return getT3CodePathError(url.pathname);
     }
 
@@ -178,6 +181,8 @@ export const getIssueChatT3UrlValidationError = (value: string): string | undefi
       (!url.port || url.port === "443") &&
       url.origin === T3_CODE_HOSTED_ORIGIN
     ) {
+      const queryError = getT3CodeQueryError(url);
+      if (queryError) return queryError;
       return getT3CodePathError(url.pathname);
     }
 
@@ -190,6 +195,119 @@ export const getIssueChatT3UrlValidationError = (value: string): string | undefi
 export const getSafeT3CodeLink = (value: string | null | undefined): string | undefined => {
   if (!value || getIssueChatT3UrlValidationError(value)) return undefined;
   return value.trim();
+};
+
+export type TParsedT3CodeThreadLink = {
+  url: string;
+  environmentId: string;
+  threadId: string;
+  codexThreadId?: string;
+  title?: string;
+};
+
+export type TParsedT3ThreadInput =
+  | { kind: "codex"; codexThreadId: string }
+  | { kind: "t3"; reference: TParsedT3CodeThreadLink }
+  | { kind: "context"; contextId: string; codexThreadId?: string };
+
+function getT3CodeQueryError(url: URL): string | undefined {
+  for (const key of url.searchParams.keys()) {
+    if (!T3_CODE_QUERY_PARAMS.has(key)) {
+      return "T3 Code links support only codexThreadId and title query parameters.";
+    }
+  }
+
+  const codexThreadIds = url.searchParams.getAll("codexThreadId");
+  if (codexThreadIds.length > 1) return "T3 Code links can contain only one codexThreadId.";
+  if (codexThreadIds.length === 1 && !UUID_RE.test(codexThreadIds[0]!.trim())) {
+    return "codexThreadId must be a UUID.";
+  }
+
+  const titles = url.searchParams.getAll("title");
+  if (titles.length > 1) return "T3 Code links can contain only one title.";
+  if (titles.length === 1 && titles[0]!.trim().length > 255) {
+    return "The T3 link title is too long.";
+  }
+  return undefined;
+}
+
+const decodeT3PathSegment = (segment: string): string | undefined => {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return undefined;
+  }
+};
+
+export const getCodexThreadIdFromT3ThreadId = (threadId: string): string | undefined => {
+  const prefix = "import:codex:";
+  if (!threadId.startsWith(prefix)) return undefined;
+  const candidate = threadId.slice(prefix.length);
+  return UUID_RE.test(candidate) ? candidate.toLowerCase() : undefined;
+};
+
+export const parseT3CodeThreadLink = (value: string): TParsedT3CodeThreadLink | undefined => {
+  if (getIssueChatT3UrlValidationError(value)) return undefined;
+
+  try {
+    const url = new URL(value.trim());
+    const segments = url.pathname
+      .replace(/^\/+|\/+$/g, "")
+      .split("/")
+      .map(decodeT3PathSegment);
+    if (segments.length !== 2 || !segments[0] || !segments[1]) return undefined;
+
+    const environmentId = segments[0];
+    const threadId = segments[1];
+    const requestedCodexThreadId = url.searchParams.get("codexThreadId")?.trim();
+    const codexThreadId =
+      (requestedCodexThreadId && UUID_RE.test(requestedCodexThreadId)
+        ? requestedCodexThreadId.toLowerCase()
+        : undefined) ?? getCodexThreadIdFromT3ThreadId(threadId);
+    const title = url.searchParams.get("title")?.trim();
+
+    return {
+      url: value.trim(),
+      environmentId,
+      threadId,
+      ...(codexThreadId ? { codexThreadId } : {}),
+      ...(title ? { title: title.slice(0, 255) } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+};
+
+export const parseT3ContextThreadLink = (value: string): { contextId: string; codexThreadId?: string } | undefined => {
+  const match = /t3-context:\/\/v1\/thread\/([a-z0-9_-]+)/i.exec(value.trim());
+  if (!match) return undefined;
+
+  const contextId = match[1]!;
+  const prefix = "thread_import-codex-";
+  if (!contextId.startsWith(prefix)) return { contextId };
+
+  const candidate = contextId.slice(prefix.length);
+  return {
+    contextId,
+    ...(UUID_RE.test(candidate) ? { codexThreadId: candidate.toLowerCase() } : {}),
+  };
+};
+
+export const parseT3ThreadInput = (value: string): TParsedT3ThreadInput | undefined => {
+  const normalized = value.trim();
+  if (!normalized) return undefined;
+  if (UUID_RE.test(normalized)) {
+    return { kind: "codex", codexThreadId: normalized.toLowerCase() };
+  }
+
+  const t3LinkMatch = /(?:t3code:\/\/|https:\/\/app\.t3\.codes\/)[^\s)\]]+/i.exec(normalized);
+  if (t3LinkMatch) {
+    const reference = parseT3CodeThreadLink(t3LinkMatch[0]);
+    if (reference) return { kind: "t3", reference };
+  }
+
+  const context = parseT3ContextThreadLink(normalized);
+  return context ? { kind: "context", ...context } : undefined;
 };
 
 export const getIssueChatUrlValidationError = (value: string, provider: TIssueChatProvider): string | undefined => {

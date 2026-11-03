@@ -20,6 +20,7 @@ import {
   getIssueChatProviderLabel,
   getSafeIssueChatWebLink,
   getSafeT3CodeLink,
+  parseT3CodeThreadLink,
 } from "./helpers";
 
 type Props = {
@@ -42,6 +43,7 @@ export function IssueChatBindingItem(props: Props) {
   const { binding, disabled, actionError, pendingAction, onMarkSeen, onManualAttention, onEdit } = props;
   const nativeCodexUrl = binding.provider === "codex" ? getCodexThreadDeepLink(binding.thread_id) : undefined;
   const t3CodeLink = getSafeT3CodeLink(binding.t3_url);
+  const t3Thread = parseT3CodeThreadLink(binding.t3_url);
   const webLink = getSafeIssueChatWebLink(binding.link?.url);
   const webLinkLabel = binding.link?.title?.trim() || webLink || "Chat link unavailable";
   const stateLabel = getIssueChatObservationStateLabel(binding.observation_state);
@@ -60,8 +62,13 @@ export function IssueChatBindingItem(props: Props) {
               {getIssueChatProviderLabel(binding.provider)}
             </span>
             <span className="truncate text-11 text-tertiary" title={binding.thread_id}>
-              Thread {binding.thread_id}
+              Codex {binding.thread_id}
             </span>
+            {t3Thread && (
+              <span className="truncate text-11 text-tertiary" title={t3Thread.environmentId}>
+                T3 {t3Thread.threadId}
+              </span>
+            )}
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
             {nativeCodexUrl && (

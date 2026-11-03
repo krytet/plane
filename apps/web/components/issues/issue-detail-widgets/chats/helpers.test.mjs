@@ -17,6 +17,8 @@ import {
   getIssueChatProviderLabel,
   getSafeIssueChatWebLink,
   getSafeT3CodeLink,
+  parseT3CodeThreadLink,
+  parseT3ThreadInput,
   isCurrentIssueChatRefreshLifecycle,
   isValidIssueChatUrl,
   shouldApplyIssueChatRefresh,
@@ -114,14 +116,44 @@ test("builds and validates only exact native Codex thread deep links", () => {
 test("accepts only exact T3 Code native and hosted thread links", () => {
   const environmentId = "environment-1";
   const threadId = "import:codex:01900000-0000-7000-8000-000000000000";
+  const codexThreadId = "01900000-0000-7000-8000-000000000000";
   const nativeUrl = `t3code://threads/${environmentId}/${threadId}`;
   const hostedUrl = `https://app.t3.codes/${environmentId}/${threadId}`;
+  const planeUrl = `${nativeUrl}?codexThreadId=${codexThreadId}&title=Plane%20chat`;
 
   assert.equal(getIssueChatT3UrlValidationError(""), undefined);
   assert.equal(getIssueChatT3UrlValidationError(nativeUrl), undefined);
   assert.equal(getIssueChatT3UrlValidationError(hostedUrl), undefined);
+  assert.equal(getIssueChatT3UrlValidationError(planeUrl), undefined);
   assert.equal(getSafeT3CodeLink(nativeUrl), nativeUrl);
   assert.equal(getSafeT3CodeLink(hostedUrl), hostedUrl);
+  assert.deepEqual(parseT3CodeThreadLink(planeUrl), {
+    url: planeUrl,
+    environmentId,
+    threadId,
+    codexThreadId,
+    title: "Plane chat",
+  });
+  assert.equal(parseT3CodeThreadLink(nativeUrl)?.codexThreadId, codexThreadId);
+  assert.deepEqual(parseT3ThreadInput(planeUrl), {
+    kind: "t3",
+    reference: {
+      url: planeUrl,
+      environmentId,
+      threadId,
+      codexThreadId,
+      title: "Plane chat",
+    },
+  });
+  assert.deepEqual(parseT3ThreadInput(` ${codexThreadId} `), {
+    kind: "codex",
+    codexThreadId,
+  });
+  assert.deepEqual(parseT3ThreadInput(`[Plane](t3-context://v1/thread/thread_import-codex-${codexThreadId})`), {
+    kind: "context",
+    contextId: `thread_import-codex-${codexThreadId}`,
+    codexThreadId,
+  });
 
   for (const value of [
     `https://app.t3.codes/threads/${environmentId}/${threadId}`,
@@ -131,6 +163,10 @@ test("accepts only exact T3 Code native and hosted thread links", () => {
     `t3code://threads/${environmentId}`,
     `t3code://threads/${environmentId}/${threadId}/extra`,
     `${nativeUrl}?prompt=test`,
+    `${nativeUrl}?codexThreadId=not-a-uuid`,
+    `${nativeUrl}?codexThreadId=${codexThreadId}&codexThreadId=${codexThreadId}`,
+    `${nativeUrl}?codexThreadId=${codexThreadId}&foo=bar`,
+    `${nativeUrl}?title=${"x".repeat(256)}`,
     `${hostedUrl}#fragment`,
     `https://user:token@app.t3.codes/${environmentId}/${threadId}`,
   ]) {

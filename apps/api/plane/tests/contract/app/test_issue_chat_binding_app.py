@@ -206,7 +206,10 @@ def test_app_route_accepts_only_matching_native_codex_urls_and_keeps_chatgpt_htt
 @pytest.mark.django_db
 def test_app_route_stores_updates_and_clears_a_t3_code_link(tenant):
     thread_id = str(uuid4())
-    t3_url = f"t3code://threads/environment-1/{thread_id}"
+    t3_url = (
+        f"t3code://threads/environment-1/import:codex:{thread_id}"
+        f"?codexThreadId={thread_id}&title=Plane+chat"
+    )
     payload = {
         "provider": "codex",
         "thread_id": thread_id,
@@ -259,6 +262,29 @@ def test_app_route_rejects_an_invalid_t3_code_link(tenant):
             "provider": "codex",
             "thread_id": thread_id,
             "t3_url": f"https://app.t3.codes/threads/environment-1/{thread_id}",
+        },
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "t3_url" in response.data
+    assert not IssueChatBinding.objects.filter(issue=tenant["issue"]).exists()
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_app_route_rejects_a_t3_link_for_a_different_codex_thread(tenant):
+    thread_id = str(uuid4())
+    other_thread_id = str(uuid4())
+    response = tenant["client"].post(
+        _url(tenant["workspace"], tenant["issue"]),
+        {
+            "provider": "codex",
+            "thread_id": thread_id,
+            "t3_url": (
+                f"t3code://threads/environment-1/import:codex:{thread_id}"
+                f"?codexThreadId={other_thread_id}"
+            ),
         },
         format="json",
     )

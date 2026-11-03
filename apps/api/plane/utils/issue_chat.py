@@ -8,7 +8,7 @@ import re
 from copy import deepcopy
 from dataclasses import dataclass
 from html import escape
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
 from bs4 import BeautifulSoup
@@ -40,6 +40,7 @@ CODEX_NATIVE_URL_PREFIX = "codex://threads/"
 T3_CODE_NATIVE_URL_PREFIX = "t3code://threads/"
 T3_CODE_HOSTED_ORIGIN = "https://app.t3.codes"
 T3_CODE_URL_MAX_LENGTH = 2048
+T3_CODE_QUERY_PARAMS = frozenset({"codexThreadId", "title"})
 T3_CODE_LINK_MESSAGE = (
     "T3 Code links must use t3code://threads/<environment_id>/<thread_id> "
     "or https://app.t3.codes/<environment_id>/<thread_id>."
@@ -298,10 +299,10 @@ def normalize_t3_code_url(value):
     except ValueError as exc:
         raise IssueChatInputError("t3_url", T3_CODE_LINK_MESSAGE) from exc
 
-    if parts.username or parts.password or parts.query or parts.fragment:
+    if parts.username or parts.password or parts.fragment:
         raise IssueChatInputError(
             "t3_url",
-            "T3 Code links cannot contain credentials, query parameters, or fragments.",
+            "T3 Code links cannot contain credentials or fragments.",
         )
 
     if parts.scheme.lower() == "t3code":
@@ -320,11 +321,61 @@ def normalize_t3_code_url(value):
     if len(segments) != 2:
         raise IssueChatInputError("t3_url", "T3 Code links require exactly an environment ID and thread ID.")
 
+    query_pairs = parse_qsl(parts.query, keep_blank_values=True)
+    query_values = {}
+    for key, value in query_pairs:
+        if key not in T3_CODE_QUERY_PARAMS:
+            raise IssueChatInputError(
+                "t3_url",
+                "T3 Code links support only codexThreadId and title query parameters.",
+            )
+        if key in query_values:
+            raise IssueChatInputError("t3_url", f"T3 Code links can contain only one {key}.")
+        query_values[key] = value
+
+    codex_thread_id = normalize_codex_thread_id(query_values.get("codexThreadId"))
+    if "codexThreadId" in query_values and codex_thread_id is None:
+        raise IssueChatInputError("t3_url", "codexThreadId must be a UUID.")
+    title = _normalize_item(query_values.get("title", ""))
+    if len(title) > 255:
+        raise IssueChatInputError("t3_url", "The T3 link title is too long.")
+
     environment_id, thread_id = (_normalize_t3_path_segment(segment) for segment in segments)
+    canonical_pairs = []
+    if codex_thread_id:
+        canonical_pairs.append(("codexThreadId", codex_thread_id))
+    if title:
+        canonical_pairs.append(("title", title))
+    canonical_query = urlencode(canonical_pairs)
     canonical_url = f"{base_url}/{environment_id}/{thread_id}"
+    if canonical_query:
+        canonical_url = f"{canonical_url}?{canonical_query}"
     if len(canonical_url) > T3_CODE_URL_MAX_LENGTH:
         raise IssueChatInputError("t3_url", "The T3 Code link is too long.")
     return canonical_url
+
+
+def extract_t3_codex_thread_id(value):
+    """Return the Codex native thread ID carried by a T3 Code link, when present."""
+
+    normalized = normalize_t3_code_url(value)
+    if not normalized:
+        return None
+
+    parts = urlsplit(normalized)
+    query_values = dict(parse_qsl(parts.query))
+    query_thread_id = normalize_codex_thread_id(query_values.get("codexThreadId"))
+    if query_thread_id is not None:
+        return query_thread_id
+
+    segments = parts.path.strip("/").split("/")
+    if len(segments) != 2:
+        return None
+    thread_id = unquote(segments[1])
+    prefix = "import:codex:"
+    if not thread_id.startswith(prefix):
+        return None
+    return normalize_codex_thread_id(thread_id[len(prefix) :])
 
 
 def normalize_chat_binding_url(provider, thread_id, value):
@@ -1147,6 +1198,13 @@ def create_issue_chat_binding(
     normalized_thread_id, requested_url = _normalize_binding_identity(provider, thread_id, url)
     requested_title = _normalize_item(title) if title else None
     normalized_t3_url = normalize_t3_code_url(t3_url)
+    linked_codex_thread_id = extract_t3_codex_thread_id(normalized_t3_url)
+    if (
+        provider == IssueChatBinding.Provider.CODEX
+        and linked_codex_thread_id is not None
+        and linked_codex_thread_id != normalized_thread_id
+    ):
+        raise IssueChatInputError("t3_url", "The T3 Code link belongs to a different Codex thread.")
 
     try:
         with transaction.atomic():
