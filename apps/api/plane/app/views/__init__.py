@@ -146,6 +146,19 @@ from .issue.chat import (
     IssueChatManualAttentionEndpoint,
 )
 
+from .jira_integration import (
+    JiraDraftApproveEndpoint,
+    JiraDraftEndpoint,
+    JiraDraftSubmitEndpoint,
+    JiraIssueBindingEndpoint,
+    JiraIssueConsentEndpoint,
+    JiraOperationEndpoint,
+    JiraPersonalConnectionEndpoint,
+    JiraProjectPolicyEndpoint,
+    JiraReadinessEndpoint,
+)
+from .jira_development import JiraDevelopmentPlanEndpoint
+
 from .issue.label import LabelViewSet, BulkCreateIssueLabelsEndpoint
 
 from .issue.link import IssueLinkViewSet

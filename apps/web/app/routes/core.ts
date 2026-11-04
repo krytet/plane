@@ -351,6 +351,11 @@ export const coreRoutes: RouteConfigEntry[] = [
                 "./(all)/[workspaceSlug]/(settings)/settings/projects/[projectId]/automations/page.tsx"
               ),
             ]),
+            // Project Jira synchronization
+            route(
+              ":workspaceSlug/settings/projects/:projectId/jira",
+              "./(all)/[workspaceSlug]/(settings)/settings/projects/[projectId]/jira/page.tsx"
+            ),
           ]),
         ]),
       ]),

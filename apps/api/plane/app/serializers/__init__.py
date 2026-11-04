@@ -142,3 +142,18 @@ from .draft import (
     DraftIssueSerializer,
     DraftIssueDetailSerializer,
 )
+
+from .jira_integration import (
+    JiraBindingInputSerializer,
+    JiraConsentInputSerializer,
+    JiraConsentSerializer,
+    JiraCredentialInputSerializer,
+    JiraDraftApproveSerializer,
+    JiraDraftInputSerializer,
+    JiraDraftSerializer,
+    JiraDraftSubmitSerializer,
+    JiraGrantSerializer,
+    JiraIssueBindingSerializer,
+    JiraOperationSerializer,
+    JiraProjectPolicySerializer,
+)

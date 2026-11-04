@@ -197,6 +197,11 @@
         "duration": "Send reminder before"
       }
     },
+    "jira": {
+      "label": "Jira",
+      "heading": "Jira integration",
+      "description": "Connect your personal Jira account, link existing work items, and configure explicit status sync."
+    },
     "empty_state": {
       "labels": {
         "title": "No labels yet",
