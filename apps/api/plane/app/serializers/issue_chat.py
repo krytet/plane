@@ -8,6 +8,7 @@ from plane.db.models import IssueChatBinding
 from plane.utils.issue_chat import (
     IssueChatInputError,
     binding_is_unread,
+    extract_t3_thread_identity,
     get_current_user_seen,
     normalize_chat_binding_url,
     normalize_t3_code_url,
@@ -54,6 +55,13 @@ class IssueChatBindingSyncSerializer(serializers.Serializer):
             raise serializers.ValidationError("Thread ID cannot be blank.")
         return value
 
+    def validate_provider(self, value):
+        if value == IssueChatBinding.Provider.T3CODE:
+            raise serializers.ValidationError(
+                "T3 Code bindings are manual only and cannot accept sync fields."
+            )
+        return value
+
     def validate(self, attrs):
         attrs["title"] = attrs.get("title") or None
         try:
@@ -69,7 +77,7 @@ class IssueChatBindingSyncSerializer(serializers.Serializer):
 
 class IssueChatBindingCreateSerializer(serializers.Serializer):
     provider = serializers.ChoiceField(choices=IssueChatBinding.Provider.choices)
-    thread_id = serializers.CharField(max_length=255, trim_whitespace=True)
+    thread_id = serializers.CharField(max_length=255, trim_whitespace=True, required=False)
     url = serializers.CharField(max_length=2048, required=False, allow_blank=False)
     title = serializers.CharField(max_length=255, trim_whitespace=True, required=False, allow_blank=True)
     t3_url = serializers.CharField(
@@ -85,9 +93,29 @@ class IssueChatBindingCreateSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         attrs["title"] = attrs.get("title") or None
+        provider = attrs["provider"]
         try:
+            if provider == IssueChatBinding.Provider.T3CODE:
+                normalized_t3_url = normalize_t3_code_url(attrs.get("t3_url"))
+                t3_identity = extract_t3_thread_identity(normalized_t3_url)
+                if t3_identity is None:
+                    raise IssueChatInputError("t3_url", "A T3 Code thread link is required.")
+                if len(t3_identity["thread_id"]) > 255:
+                    raise IssueChatInputError("t3_url", "The T3 Code thread ID is too long.")
+                requested_thread_id = (attrs.get("thread_id") or "").strip()
+                if requested_thread_id and requested_thread_id != t3_identity["thread_id"]:
+                    raise IssueChatInputError(
+                        "t3_url",
+                        "The T3 Code link belongs to a different T3 thread.",
+                    )
+                attrs["thread_id"] = t3_identity["thread_id"]
+                attrs["t3_url"] = t3_identity["url"]
+                attrs.pop("url", None)
+                return attrs
+            if not attrs.get("thread_id"):
+                raise IssueChatInputError("thread_id", "Thread ID is required.")
             attrs["url"] = normalize_chat_binding_url(
-                attrs["provider"],
+                provider,
                 attrs["thread_id"],
                 attrs.get("url"),
             )

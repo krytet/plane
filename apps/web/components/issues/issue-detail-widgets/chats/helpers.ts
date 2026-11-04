@@ -14,6 +14,7 @@ import type {
 const PROVIDER_LABELS: Record<TIssueChatProvider, string> = {
   codex: "Codex",
   chatgpt: "ChatGPT",
+  t3code: "T3 Code",
 };
 
 const OBSERVATION_STATE_LABELS: Record<TIssueChatObservationState, string> = {
@@ -32,6 +33,7 @@ const OBSERVATION_SOURCE_LABELS: Record<TIssueChatObservationSource, string> = {
 const PROVIDER_HOSTS: Record<TIssueChatProvider, Set<string>> = {
   codex: new Set(["chatgpt.com", "www.chatgpt.com", "chat.openai.com", "www.chat.openai.com"]),
   chatgpt: new Set(["chatgpt.com", "www.chatgpt.com", "chat.openai.com", "www.chat.openai.com"]),
+  t3code: new Set(),
 };
 
 const LOCAL_DEBUG_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
@@ -210,6 +212,22 @@ export type TParsedT3ThreadInput =
   | { kind: "t3"; reference: TParsedT3CodeThreadLink }
   | { kind: "context"; contextId: string; codexThreadId?: string };
 
+export type TIssueChatT3Autofill = {
+  provider: "codex" | "t3code";
+  threadId: string;
+  t3Url: string;
+  title?: string;
+  notice: string;
+};
+
+export const getIssueChatT3Autofill = (reference: TParsedT3CodeThreadLink): TIssueChatT3Autofill => ({
+  provider: reference.codexThreadId ? "codex" : "t3code",
+  threadId: reference.codexThreadId ?? reference.threadId,
+  t3Url: reference.url,
+  ...(reference.title ? { title: reference.title } : {}),
+  notice: reference.codexThreadId ? "Codex thread ID and T3 Code link filled." : "T3 Code thread ID and link filled.",
+});
+
 function getT3CodeQueryError(url: URL): string | undefined {
   for (const key of url.searchParams.keys()) {
     if (!T3_CODE_QUERY_PARAMS.has(key)) {
@@ -310,7 +328,23 @@ export const parseT3ThreadInput = (value: string): TParsedT3ThreadInput | undefi
   return context ? { kind: "context", ...context } : undefined;
 };
 
+export const isIssueChatBindingFormReady = (values: {
+  provider: TIssueChatProvider;
+  threadId: string;
+  url: string;
+  t3Url: string;
+}): boolean => {
+  if (values.provider === "t3code") {
+    const t3Link = parseT3CodeThreadLink(values.t3Url);
+    return Boolean(t3Link) && (!values.threadId.trim() || values.threadId.trim() === t3Link?.threadId);
+  }
+  return (
+    Boolean(values.threadId.trim()) && (Boolean(values.url.trim()) || Boolean(getCodexThreadDeepLink(values.threadId)))
+  );
+};
+
 export const getIssueChatUrlValidationError = (value: string, provider: TIssueChatProvider): string | undefined => {
+  if (provider === "t3code") return undefined;
   try {
     const url = new URL(value.trim());
     if (url.username || url.password) return "Chat URLs cannot contain credentials.";
@@ -338,6 +372,7 @@ export const getIssueChatBindingUrlValidationError = (
   provider: TIssueChatProvider,
   threadId: string
 ): string | undefined => {
+  if (provider === "t3code") return undefined;
   const normalizedValue = value.trim();
   const nativeCodexUrl = provider === "codex" ? getCodexThreadDeepLink(threadId) : undefined;
 

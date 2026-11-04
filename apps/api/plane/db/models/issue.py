@@ -388,6 +388,7 @@ class IssueChatBinding(ProjectBaseModel):
     class Provider(models.TextChoices):
         CODEX = "codex", "Codex"
         CHATGPT = "chatgpt", "ChatGPT"
+        T3CODE = "t3code", "T3 Code"
 
     class ObservationState(models.TextChoices):
         UNKNOWN = "unknown", "Unknown"

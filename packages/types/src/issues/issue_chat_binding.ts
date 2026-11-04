@@ -6,7 +6,7 @@
 
 import type { TIssueLink } from "./issue_link";
 
-export type TIssueChatProvider = "codex" | "chatgpt";
+export type TIssueChatProvider = "codex" | "chatgpt" | "t3code";
 
 export type TIssueChatProgress = {
   done: string[];
