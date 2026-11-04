@@ -254,6 +254,119 @@ def test_app_route_stores_updates_and_clears_a_t3_code_link(tenant):
 
 @pytest.mark.contract
 @pytest.mark.django_db
+def test_app_route_creates_a_t3_only_binding_and_derives_its_thread(tenant):
+    environment_id = str(uuid4())
+    thread_id = str(uuid4())
+    t3_url = f"t3code://threads/{environment_id}/{thread_id}?title=First+Name+and+Team"
+
+    response = tenant["client"].post(
+        _url(tenant["workspace"], tenant["issue"]),
+        {
+            "provider": "t3code",
+            "t3_url": t3_url,
+        },
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED, response.content
+    binding = IssueChatBinding.objects.get(pk=response.data["id"])
+    assert binding.provider == "t3code"
+    assert binding.thread_id == thread_id
+    assert binding.t3_url == t3_url
+    assert binding.link is not None
+    assert binding.link.url == t3_url
+    assert binding.link.title == "First Name and Team"
+    assert response.data["provider"] == "t3code"
+    assert response.data["thread_id"] == thread_id
+    assert response.data["t3_url"] == t3_url
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_app_route_requires_an_explicit_t3_thread_to_match_the_link(tenant):
+    environment_id = str(uuid4())
+    thread_id = str(uuid4())
+    other_thread_id = str(uuid4())
+    t3_url = f"t3code://threads/{environment_id}/{thread_id}"
+
+    mismatch = tenant["client"].post(
+        _url(tenant["workspace"], tenant["issue"]),
+        {
+            "provider": "t3code",
+            "thread_id": other_thread_id,
+            "t3_url": t3_url,
+        },
+        format="json",
+    )
+
+    assert mismatch.status_code == status.HTTP_400_BAD_REQUEST
+    assert "t3_url" in mismatch.data
+    assert not IssueChatBinding.objects.filter(issue=tenant["issue"]).exists()
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_app_route_requires_a_t3_link_for_a_t3_only_binding(tenant):
+    response = tenant["client"].post(
+        _url(tenant["workspace"], tenant["issue"]),
+        {"provider": "t3code"},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "t3_url" in response.data
+    assert not IssueChatBinding.objects.filter(issue=tenant["issue"]).exists()
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_app_route_keeps_a_codex_binding_with_a_matching_t3_link(tenant):
+    codex_thread_id = str(uuid4())
+    t3_url = (
+        f"t3code://threads/environment-1/{codex_thread_id}?codexThreadId={codex_thread_id}&title=First+Name+and+Team"
+    )
+
+    response = tenant["client"].post(
+        _url(tenant["workspace"], tenant["issue"]),
+        {
+            "provider": "codex",
+            "thread_id": codex_thread_id,
+            "t3_url": t3_url,
+        },
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED, response.content
+    binding = IssueChatBinding.objects.get(pk=response.data["id"])
+    assert binding.provider == "codex"
+    assert binding.thread_id == codex_thread_id
+    assert binding.t3_url == t3_url
+    assert binding.link.url == f"codex://threads/{codex_thread_id}"
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
+def test_app_route_rejects_sync_fields_for_a_t3_only_binding(tenant):
+    thread_id = str(uuid4())
+
+    response = tenant["client"].post(
+        _url(tenant["workspace"], tenant["issue"]),
+        {
+            "provider": "t3code",
+            "t3_url": f"t3code://threads/environment-1/{thread_id}",
+            "cursor": 1,
+            "progress": {"done": [], "now": [], "waiting": []},
+        },
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "provider" in response.data
+    assert not IssueChatBinding.objects.filter(issue=tenant["issue"]).exists()
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
 def test_app_route_rejects_an_invalid_t3_code_link(tenant):
     thread_id = str(uuid4())
     response = tenant["client"].post(

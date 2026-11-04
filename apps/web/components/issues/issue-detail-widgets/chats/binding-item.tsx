@@ -44,7 +44,7 @@ export function IssueChatBindingItem(props: Props) {
   const nativeCodexUrl = binding.provider === "codex" ? getCodexThreadDeepLink(binding.thread_id) : undefined;
   const t3CodeLink = getSafeT3CodeLink(binding.t3_url);
   const t3Thread = parseT3CodeThreadLink(binding.t3_url);
-  const webLink = getSafeIssueChatWebLink(binding.link?.url);
+  const webLink = binding.provider === "t3code" ? undefined : getSafeIssueChatWebLink(binding.link?.url);
   const webLinkLabel = binding.link?.title?.trim() || webLink || "Chat link unavailable";
   const stateLabel = getIssueChatObservationStateLabel(binding.observation_state);
   const sourceLabel = getIssueChatObservationSourceLabel(binding.observation_source);
@@ -61,9 +61,11 @@ export function IssueChatBindingItem(props: Props) {
             <span className="rounded-sm bg-accent-primary/10 px-1.5 py-0.5 text-10 font-medium text-accent-primary">
               {getIssueChatProviderLabel(binding.provider)}
             </span>
-            <span className="truncate text-11 text-tertiary" title={binding.thread_id}>
-              Codex {binding.thread_id}
-            </span>
+            {binding.provider !== "t3code" && (
+              <span className="truncate text-11 text-tertiary" title={binding.thread_id}>
+                Codex {binding.thread_id}
+              </span>
+            )}
             {t3Thread && (
               <span className="truncate text-11 text-tertiary" title={t3Thread.environmentId}>
                 T3 {t3Thread.threadId}

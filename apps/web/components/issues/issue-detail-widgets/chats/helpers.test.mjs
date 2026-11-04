@@ -10,6 +10,7 @@ import {
   getIssueChatObservationSourceLabel,
   getIssueChatObservationStateLabel,
   getIssueChatPlaneReadLabel,
+  getIssueChatT3Autofill,
   getCodexThreadDeepLink,
   getIssueChatBindingUrlValidationError,
   getIssueChatT3UrlValidationError,
@@ -17,6 +18,7 @@ import {
   getIssueChatProviderLabel,
   getSafeIssueChatWebLink,
   getSafeT3CodeLink,
+  isIssueChatBindingFormReady,
   parseT3CodeThreadLink,
   parseT3ThreadInput,
   isCurrentIssueChatRefreshLifecycle,
@@ -85,6 +87,7 @@ test("matches the backend provider URL contract", () => {
   assert.match(getIssueChatUrlValidationError("http://chatgpt.com/c/example", "chatgpt"), /HTTPS/);
   assert.equal(getIssueChatProviderLabel("codex"), "Codex");
   assert.equal(getIssueChatProviderLabel("chatgpt"), "ChatGPT");
+  assert.equal(getIssueChatProviderLabel("t3code"), "T3 Code");
 });
 
 test("builds and validates only exact native Codex thread deep links", () => {
@@ -173,6 +176,77 @@ test("accepts only exact T3 Code native and hosted thread links", () => {
     assert.notEqual(getIssueChatT3UrlValidationError(value), undefined);
     assert.equal(getSafeT3CodeLink(value), undefined);
   }
+});
+
+test("autofills standalone T3 and Codex-linked T3 thread identities", () => {
+  const environmentId = "29e1d76c-4b03-4b3a-855e-19b3c4210699";
+  const threadId = "a991d61c-3818-43b6-89e2-44ba86f8a4c6";
+  const codexThreadId = "01900000-0000-7000-8000-000000000000";
+  const t3OnlyUrl = `t3code://threads/${environmentId}/${threadId}?title=First+Name+and+Team`;
+  const codexLinkedUrl = `${t3OnlyUrl}&codexThreadId=${codexThreadId}`;
+  const t3Only = parseT3CodeThreadLink(t3OnlyUrl);
+  const codexLinked = parseT3CodeThreadLink(codexLinkedUrl);
+
+  assert.deepEqual(t3Only, {
+    url: t3OnlyUrl,
+    environmentId,
+    threadId,
+    title: "First Name and Team",
+  });
+  assert.deepEqual(parseT3ThreadInput(t3OnlyUrl), { kind: "t3", reference: t3Only });
+  assert.deepEqual(getIssueChatT3Autofill(t3Only), {
+    provider: "t3code",
+    threadId,
+    t3Url: t3OnlyUrl,
+    title: "First Name and Team",
+    notice: "T3 Code thread ID and link filled.",
+  });
+  assert.equal(
+    isIssueChatBindingFormReady({
+      provider: "t3code",
+      threadId,
+      url: "",
+      t3Url: t3OnlyUrl,
+    }),
+    true
+  );
+  assert.equal(
+    isIssueChatBindingFormReady({
+      provider: "t3code",
+      threadId: "",
+      url: "",
+      t3Url: t3OnlyUrl,
+    }),
+    true
+  );
+  assert.equal(
+    isIssueChatBindingFormReady({
+      provider: "t3code",
+      threadId: "different-thread",
+      url: "",
+      t3Url: t3OnlyUrl,
+    }),
+    false
+  );
+  assert.deepEqual(getIssueChatT3Autofill(codexLinked), {
+    provider: "codex",
+    threadId: codexThreadId,
+    t3Url: codexLinkedUrl,
+    title: "First Name and Team",
+    notice: "Codex thread ID and T3 Code link filled.",
+  });
+  assert.equal(getIssueChatBindingUrlValidationError("not a web URL", "t3code", threadId), undefined);
+});
+
+test("preserves T3 thread IDs and decodes encoded mcp identifiers", () => {
+  const mcpThreadId = "mcp:linear-sync";
+  const uuidThreadId = "a991d61c-3818-43b6-89e2-44ba86f8a4c6";
+  const encodedMcpUrl = "t3code://threads/environment-1/mcp%3Alinear-sync?title=Encoded";
+  const uuidUrl = `https://app.t3.codes/environment-1/${uuidThreadId}`;
+
+  assert.equal(parseT3CodeThreadLink(encodedMcpUrl)?.threadId, mcpThreadId);
+  assert.equal(parseT3CodeThreadLink(uuidUrl)?.threadId, uuidThreadId);
+  assert.equal(parseT3ThreadInput(encodedMcpUrl)?.kind, "t3");
 });
 
 test("rejects stale refresh results after identity, request, or mutation changes", () => {

@@ -570,6 +570,13 @@ class IssueChatBindingSyncSerializer(serializers.Serializer):
             raise serializers.ValidationError("Thread ID cannot be blank.")
         return value
 
+    def validate_provider(self, value):
+        if value == IssueChatBinding.Provider.T3CODE:
+            raise serializers.ValidationError(
+                "T3 Code bindings are manual only and cannot accept sync fields."
+            )
+        return value
+
     def validate(self, attrs):
         attrs["title"] = attrs.get("title") or None
         try:

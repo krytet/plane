@@ -6,29 +6,58 @@ scoped to one explicitly configured project at a time.
 
 ## Chat links
 
-A binding can expose two destinations for the same conversation:
+A binding supports either a Codex-linked conversation or a standalone T3 Code
+thread:
 
-| Destination | Source                                    | Stored value                                                          |
-| ----------- | ----------------------------------------- | --------------------------------------------------------------------- |
-| Codex       | Synthesized from a Codex UUID `thread_id` | `codex://threads/<codex-thread-id>`                                   |
-| T3 Code     | Optional link entered on the binding      | `t3_url`, for example `t3code://threads/<environment-id>/<thread-id>` |
+| Mode          | `provider` | Required identity                                   | Optional metadata | Destinations shown              |
+| ------------- | ---------- | --------------------------------------------------- | ----------------- | ------------------------------- |
+| Codex-linked  | `codex`    | Codex UUID `thread_id`; web URL or native Codex URL | `t3_url`, title   | Codex and, when linked, T3 Code |
+| Standalone T3 | `t3code`   | `t3_url`                                            | title             | T3 Code only                    |
 
-T3 Code uses its own thread and environment identifiers, so its link cannot be
-derived from the Codex UUID. The hosted form
-`https://app.t3.codes/<environment-id>/<thread-id>` is also accepted. A T3 Code
-link is metadata only: it does not change the binding provider or start a
-chat. Use `Edit links` on an existing binding to add, replace, or clear it.
+### Codex-linked bindings
 
-`Copy thread` in T3 Code copies a deep link that carries the native Codex ID:
+Codex bindings keep their existing contract. A UUID `thread_id` can use an
+HTTPS ChatGPT URL, an exact `codex://threads/<codex-uuid>` URL, or no URL, in
+which case Plane synthesizes the native Codex link. A `t3_url` is optional.
+
+When the T3 link carries a Codex identity through
+`codexThreadId=<codex-uuid>` or an `import:codex:<codex-uuid>` thread ID, that
+identity must match the binding's `thread_id`. The binding remains a Codex
+binding and exposes both destinations. A T3 link without a Codex identity can
+also be attached as metadata to a Codex binding.
+
+`Copy thread` in T3 Code may produce:
 
 ```text
 t3code://threads/<environment-id>/<thread-id>?codexThreadId=<codex-uuid>&title=<title>
 ```
 
-Paste that link into `Paste from T3` in Plane. Plane fills the Codex thread ID,
-T3 thread ID, T3 link, and title. A legacy `t3-context://v1/thread/...` value is
-a composer context reference, not a thread deep link; Plane reports it instead
-of silently binding a broken link.
+### Standalone T3 Code bindings
+
+Use provider `t3code` when the conversation has a T3 Code thread but no Codex
+binding. The `t3_url` is required and is the source of the T3 thread identity:
+
+```text
+t3code://threads/<environment-id>/<thread-id>?title=<title>
+https://app.t3.codes/<environment-id>/<thread-id>
+```
+
+The API can omit `thread_id` and derive it from the path. If `thread_id` is
+present, it must exactly match the T3 link path. No HTTP chat URL or Codex UUID
+is required. Plane shows `Open in T3 Code` with the T3 thread ID and does not
+show a Codex destination.
+
+Standalone T3 bindings are manual links. They do not accept sync fields such
+as `cursor` or `progress`. A T3 Code link accepts only the `codexThreadId` and
+`title` query parameters, canonicalizes the URL, and rejects credentials or
+fragments.
+
+`Paste from T3` selects Codex when the link carries a Codex identity and
+selects T3 Code when it does not. Both paths fill the applicable thread ID,
+T3 link, and title. Use `Edit links` to update link metadata; the provider and
+thread identity fields remain fixed. A legacy `t3-context://v1/thread/...`
+value is a composer context reference, not a thread deep link, so Plane reports
+it instead of silently binding a broken link.
 
 ## State contract
 

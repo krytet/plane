@@ -398,6 +398,23 @@ def test_api_sync_rejects_cursor_above_database_integer_bound(tenant):
 
 @pytest.mark.contract
 @pytest.mark.django_db
+def test_api_sync_rejects_t3_code_bindings(tenant):
+    thread_id = str(uuid4())
+    payload = {
+        **_payload(cursor=1),
+        "provider": "t3code",
+        "thread_id": thread_id,
+    }
+
+    response = tenant["client"].post(_url(tenant["workspace"], tenant["issue"]), payload, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "provider" in response.data
+    assert not IssueChatBinding.objects.filter(issue=tenant["issue"]).exists()
+
+
+@pytest.mark.contract
+@pytest.mark.django_db
 def test_api_guest_work_item_list_and_detail_redact_generated_progress(tenant):
     issue = tenant["issue"]
     synced = tenant["client"].post(_url(tenant["workspace"], issue), _payload(cursor=1), format="json")

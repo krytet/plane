@@ -13,7 +13,9 @@ import type { TIssueChatBinding, TIssueChatBindingCreate, TIssueChatProvider } f
 import {
   getCodexThreadDeepLink,
   getIssueChatBindingUrlValidationError,
+  getIssueChatT3Autofill,
   getIssueChatT3UrlValidationError,
+  isIssueChatBindingFormReady,
   parseT3CodeThreadLink,
   parseT3ThreadInput,
   type TParsedT3CodeThreadLink,
@@ -22,6 +24,7 @@ import {
 const PROVIDER_OPTIONS: { label: string; value: TIssueChatProvider }[] = [
   { label: "Codex", value: "codex" },
   { label: "ChatGPT", value: "chatgpt" },
+  { label: "T3 Code", value: "t3code" },
 ];
 
 type Props = {
@@ -43,20 +46,21 @@ export function IssueChatBindingAddForm(props: Props) {
   const [pasteValue, setPasteValue] = useState("");
   const [pasteNotice, setPasteNotice] = useState<string>();
   const [validationError, setValidationError] = useState<string>();
+  const isT3Provider = provider === "t3code";
   const nativeCodexUrl = provider === "codex" ? getCodexThreadDeepLink(threadId) : undefined;
   const parsedT3Link = parseT3CodeThreadLink(t3Url);
+  const canSubmit = !isSubmitting && isIssueChatBindingFormReady({ provider, threadId, url, t3Url });
 
   const applyT3Reference = (reference: TParsedT3CodeThreadLink) => {
-    setProvider("codex");
-    if (reference.codexThreadId) setThreadId(reference.codexThreadId);
-    setT3Url(reference.url);
-    if (reference.title) setTitle(reference.title);
+    const autofill = getIssueChatT3Autofill(reference);
+    if (!isEditing) {
+      setProvider(autofill.provider);
+      setThreadId(autofill.threadId);
+    }
+    setT3Url(autofill.t3Url);
+    if (autofill.title) setTitle(autofill.title);
     setValidationError(undefined);
-    setPasteNotice(
-      reference.codexThreadId
-        ? "Codex thread ID and T3 Code link filled."
-        : "T3 Code link filled, but it does not include a Codex thread ID."
-    );
+    setPasteNotice(autofill.notice);
   };
 
   const handlePasteValueChange = (nextValue: string) => {
@@ -93,13 +97,19 @@ export function IssueChatBindingAddForm(props: Props) {
     const normalizedTitle = title.trim();
     const normalizedT3Url = t3Url.trim();
 
-    if (!normalizedThreadId) {
+    if (!isT3Provider && !normalizedThreadId) {
       setValidationError("Thread ID is required.");
       return;
     }
-    const urlError = getIssueChatBindingUrlValidationError(normalizedUrl, provider, normalizedThreadId);
-    if (urlError) {
-      setValidationError(urlError);
+    if (!isT3Provider) {
+      const urlError = getIssueChatBindingUrlValidationError(normalizedUrl, provider, normalizedThreadId);
+      if (urlError) {
+        setValidationError(urlError);
+        return;
+      }
+    }
+    if (isT3Provider && !normalizedT3Url) {
+      setValidationError("A T3 Code thread link is required.");
       return;
     }
     if (normalizedT3Url.includes("t3-context:")) {
@@ -114,7 +124,20 @@ export function IssueChatBindingAddForm(props: Props) {
       return;
     }
     const currentT3Link = parseT3CodeThreadLink(normalizedT3Url);
+    let submittedThreadId = normalizedThreadId;
+    if (isT3Provider) {
+      if (!currentT3Link) {
+        setValidationError("A T3 Code thread link is required.");
+        return;
+      }
+      if (!submittedThreadId) submittedThreadId = currentT3Link.threadId;
+      if (submittedThreadId !== currentT3Link.threadId) {
+        setValidationError("The T3 Code link belongs to a different T3 thread.");
+        return;
+      }
+    }
     if (
+      !isT3Provider &&
       currentT3Link?.codexThreadId &&
       currentT3Link.codexThreadId.toLowerCase() !== normalizedThreadId.toLowerCase()
     ) {
@@ -124,8 +147,8 @@ export function IssueChatBindingAddForm(props: Props) {
 
     const data: TIssueChatBindingCreate = {
       provider,
-      thread_id: normalizedThreadId,
-      ...(normalizedUrl ? { url: normalizedUrl } : {}),
+      thread_id: submittedThreadId,
+      ...(!isT3Provider && normalizedUrl ? { url: normalizedUrl } : {}),
       ...(normalizedTitle ? { title: normalizedTitle } : {}),
       ...(normalizedT3Url ? { t3_url: normalizedT3Url } : isEditing ? { t3_url: "" } : {}),
     };
@@ -137,8 +160,8 @@ export function IssueChatBindingAddForm(props: Props) {
       <div className="space-y-1">
         <p className="text-body-sm-medium">{isEditing ? "Edit chat links" : "Add a chat binding"}</p>
         <p className="text-11 text-tertiary">
-          Binding stores Codex/ChatGPT identifiers and an optional T3 Code link. It does not sync or start a chat
-          automatically.
+          Bind a Codex or ChatGPT thread, or link directly to a standalone T3 Code thread. It does not sync or start a
+          chat automatically.
         </p>
       </div>
 
@@ -152,9 +175,9 @@ export function IssueChatBindingAddForm(props: Props) {
         onChange={(event) => handlePasteValueChange(event.target.value)}
         placeholder="Copy thread in T3, then paste the link here"
         hint="Accepts a T3 thread link, a legacy T3 context link, or a Codex UUID."
-        disabled={isSubmitting}
+        disabled={isSubmitting || isEditing}
       />
-      {pasteNotice && <p className="text-11 text-tertiary">{pasteNotice}</p>}
+      {pasteNotice && <p className="text-11 font-medium text-success-primary">{pasteNotice}</p>}
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div className="space-y-1">
@@ -202,25 +225,28 @@ export function IssueChatBindingAddForm(props: Props) {
             }
             setThreadId(nextValue);
           }}
-          placeholder="Codex UUID, or paste a T3 thread link"
-          disabled={isSubmitting || isEditing}
+          placeholder={isT3Provider ? "Filled from the T3 Code link" : "Codex UUID, or paste a T3 thread link"}
+          hint={isT3Provider ? "Derived from the T3 Code link" : undefined}
+          disabled={isSubmitting || isEditing || isT3Provider}
           maxLength={255}
-          required
+          required={!isT3Provider}
         />
 
-        <InputField
-          id="chat-binding-url"
-          type="text"
-          size="md"
-          orientation="vertical"
-          label="URL"
-          value={url}
-          onChange={(event) => setUrl(event.target.value)}
-          placeholder={nativeCodexUrl ?? "https://chatgpt.com/c/..."}
-          hint={nativeCodexUrl ? "Optional for a local Codex UUID; blank uses the native link." : "Required"}
-          disabled={isSubmitting}
-          required={!nativeCodexUrl}
-        />
+        {!isT3Provider && (
+          <InputField
+            id="chat-binding-url"
+            type="text"
+            size="md"
+            orientation="vertical"
+            label="URL"
+            value={url}
+            onChange={(event) => setUrl(event.target.value)}
+            placeholder={nativeCodexUrl ?? "https://chatgpt.com/c/..."}
+            hint={nativeCodexUrl ? "Optional for a local Codex UUID; blank uses the native link." : "Required"}
+            disabled={isSubmitting}
+            required={!nativeCodexUrl}
+          />
+        )}
 
         <InputField
           id="chat-binding-t3-url"
@@ -236,9 +262,14 @@ export function IssueChatBindingAddForm(props: Props) {
             if (parsed) applyT3Reference(parsed);
           }}
           placeholder="t3code://threads/<environment>/<thread>?codexThreadId=<uuid>"
-          hint="Optional. Paste a T3 thread link; its Codex ID fills automatically."
+          hint={
+            isT3Provider
+              ? "Required. The T3 thread ID is derived from this link."
+              : "Optional. Paste a T3 thread link; a Codex ID fills automatically when present."
+          }
           disabled={isSubmitting}
           maxLength={2048}
+          required={isT3Provider}
         />
 
         <InputField
@@ -256,7 +287,13 @@ export function IssueChatBindingAddForm(props: Props) {
         />
       </div>
 
-      {parsedT3Link && (
+      {parsedT3Link && isT3Provider && (
+        <p className="text-11 text-tertiary">
+          T3 {parsedT3Link.threadId} - env {parsedT3Link.environmentId}
+        </p>
+      )}
+
+      {parsedT3Link && !isT3Provider && (
         <p className="text-11 text-tertiary">
           Codex {parsedT3Link.codexThreadId ?? "not included"} · T3 {parsedT3Link.threadId} · env{" "}
           {parsedT3Link.environmentId}
@@ -286,6 +323,7 @@ export function IssueChatBindingAddForm(props: Props) {
           stretch="auto"
           label={isEditing ? "Save binding" : "Add binding"}
           loading={isSubmitting}
+          disabled={!canSubmit}
         />
       </div>
     </form>

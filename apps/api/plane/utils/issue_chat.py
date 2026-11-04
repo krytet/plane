@@ -52,6 +52,7 @@ PROVIDER_HOSTS = {
     IssueChatBinding.Provider.CHATGPT: frozenset(
         {"chatgpt.com", "www.chatgpt.com", "chat.openai.com", "www.chat.openai.com"}
     ),
+    IssueChatBinding.Provider.T3CODE: frozenset(),
 }
 OBSERVATION_ATTENTION_STATES = frozenset(
     {
@@ -376,6 +377,34 @@ def extract_t3_codex_thread_id(value):
     if not thread_id.startswith(prefix):
         return None
     return normalize_codex_thread_id(thread_id[len(prefix) :])
+
+
+def extract_t3_thread_identity(value):
+    """Return the canonical T3 thread identity carried by a T3 Code link."""
+
+    normalized = normalize_t3_code_url(value)
+    if not normalized:
+        return None
+
+    parts = urlsplit(normalized)
+    segments = [unquote(segment) for segment in parts.path.strip("/").split("/")]
+    if len(segments) != 2:
+        return None
+
+    query_values = dict(parse_qsl(parts.query))
+    codex_thread_id = normalize_codex_thread_id(query_values.get("codexThreadId"))
+    if codex_thread_id is None:
+        prefix = "import:codex:"
+        if segments[1].startswith(prefix):
+            codex_thread_id = normalize_codex_thread_id(segments[1][len(prefix) :])
+
+    return {
+        "url": normalized,
+        "environment_id": segments[0],
+        "thread_id": segments[1],
+        "codex_thread_id": codex_thread_id,
+        "title": _normalize_item(query_values.get("title", "")),
+    }
 
 
 def normalize_chat_binding_url(provider, thread_id, value):
@@ -1195,16 +1224,28 @@ def create_issue_chat_binding(
 ):
     """Create or return a manual binding without inventing sync state."""
 
-    normalized_thread_id, requested_url = _normalize_binding_identity(provider, thread_id, url)
-    requested_title = _normalize_item(title) if title else None
     normalized_t3_url = normalize_t3_code_url(t3_url)
-    linked_codex_thread_id = extract_t3_codex_thread_id(normalized_t3_url)
-    if (
-        provider == IssueChatBinding.Provider.CODEX
-        and linked_codex_thread_id is not None
-        and linked_codex_thread_id != normalized_thread_id
-    ):
-        raise IssueChatInputError("t3_url", "The T3 Code link belongs to a different Codex thread.")
+    if provider == IssueChatBinding.Provider.T3CODE:
+        t3_identity = extract_t3_thread_identity(normalized_t3_url)
+        if t3_identity is None:
+            raise IssueChatInputError("t3_url", "A T3 Code thread link is required.")
+        normalized_thread_id = (thread_id or "").strip() or t3_identity["thread_id"]
+        if len(normalized_thread_id) > 255:
+            raise IssueChatInputError("t3_url", "The T3 Code thread ID is too long.")
+        if normalized_thread_id != t3_identity["thread_id"]:
+            raise IssueChatInputError("t3_url", "The T3 Code link belongs to a different T3 thread.")
+        requested_url = t3_identity["url"]
+        requested_title = _normalize_item(title) if title else t3_identity["title"] or None
+    else:
+        normalized_thread_id, requested_url = _normalize_binding_identity(provider, thread_id, url)
+        requested_title = _normalize_item(title) if title else None
+        linked_codex_thread_id = extract_t3_codex_thread_id(normalized_t3_url)
+        if (
+            provider == IssueChatBinding.Provider.CODEX
+            and linked_codex_thread_id is not None
+            and linked_codex_thread_id != normalized_thread_id
+        ):
+            raise IssueChatInputError("t3_url", "The T3 Code link belongs to a different Codex thread.")
 
     try:
         with transaction.atomic():

@@ -432,7 +432,7 @@ export const ChatsCollapsible = observer(function ChatsCollapsible(props: Props)
           ))
         ) : (
           <p className="text-11 text-tertiary">
-            No chat bindings yet. Add a web link, a Codex thread UUID, and optionally a T3 Code link.
+            No chat bindings yet. Add a Codex or ChatGPT thread, or link a standalone T3 Code thread.
           </p>
         )}
       </div>
