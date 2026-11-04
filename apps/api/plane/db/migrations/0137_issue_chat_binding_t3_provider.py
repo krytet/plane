@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("db", "0129_issue_chat_binding_t3_url"),
+        ("db", "0136_jira_development_profile"),
     ]
 
     operations = [
